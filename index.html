@@ -1,24 +1,32 @@
 <!doctype html>
-<html>
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <title>Exploding Potatoes</title>
+<link rel="icon" href="assets/potato_bomb.png">
 <style>
-  body { background: #0d0e14; display: flex; flex-direction: column; align-items: center; gap: 10px; font-family: monospace; color: #9aa3b8; }
-  canvas { image-rendering: pixelated; image-rendering: crisp-edges; border: 2px solid #232838; }
-  #hud { font-size: 14px; letter-spacing: 1px; }
+  body { margin: 0; padding: 10px; background: #0d0e14; display: flex; flex-direction: column; align-items: center; gap: 10px; font-family: monospace; color: #9aa3b8; }
+  /* square, as large as fits the window, never above native size */
+  canvas { width: min(672px, calc(100vw - 24px), calc(100vh - 70px)); aspect-ratio: 1; border: 2px solid #232838; }
+  #hud { display: flex; align-items: center; gap: 14px; min-height: 24px; font-size: 14px; letter-spacing: 1px; }
+  #lives { display: flex; gap: 4px; }
+  /* first frame of the sprite sheet (facing the player), at 2x */
+  #lives i { width: 32px; height: 36px; background: url(assets/farmer.png) 0 0 / 96px 144px; image-rendering: pixelated; }
+  #lives i.lost { filter: grayscale(1) brightness(0.35); }
 </style>
 </head>
 <body>
-<div id="hud">loading&hellip;</div>
-<canvas id="c" width="504" height="504"></canvas>
+<div id="hud"><span id="msg">loading&hellip;</span><span id="lives" role="img"></span><span id="over"></span></div>
+<canvas id="c" width="672" height="672"></canvas>
 <script src="potato.js"></script>
 <script>
 window.__pageerr = '';
 function report(tag, e) {
   window.__pageerr = (e && e.stack || String(e)) + '';
-  var hud = document.getElementById('hud');
-  if (hud) hud.textContent = tag + ' FAIL: ' + (e && e.message || e);
+  const hint = location.protocol === 'file:'
+    ? ' (serve this folder over HTTP: python3 -m http.server 8080)' : '';
+  const msg = document.getElementById('msg');
+  if (msg) msg.textContent = tag + ' FAIL: ' + (e && e.message || e) + hint;
 }
 (async () => {
   try {
@@ -26,60 +34,105 @@ function report(tag, e) {
     window.__P = P;  // debug/test handle
     const W = P._game_w(), H = P._game_h();
     const cv = document.getElementById('c'), ctx = cv.getContext('2d');
-    const hud = document.getElementById('hud');
+    cv.width = W; cv.height = H;
+    const msg = document.getElementById('msg');
+    const lives = document.getElementById('lives');
+    const over = document.getElementById('over');
+    const MAX_HEARTS = 3;
+    for (let i = 0; i < MAX_HEARTS; i++) lives.appendChild(document.createElement('i'));
+
+    const calm = matchMedia('(prefers-reduced-motion: reduce)');
+    const applyMotion = () => P._set_reduced_motion(calm.matches ? 1 : 0);
+    calm.addEventListener('change', applyMotion);
+    applyMotion();
+
     P._init_game();
     // The C framebuffer is a static array at a fixed heap offset — _game_buf() returns it.
     const base = P._game_buf() | 0, n = W * H * 4;
     const view = () => new Uint8ClampedArray(P.HEAPU8.buffer, base, n);
-    function hud2() {
-      const h = P._get_hearts();
-      hud.textContent = 'score ' + P._get_score() + '   ' +
-        '\u{1F954}'.repeat(h) + '\u00B7'.repeat(3 - h) +
-        (P._get_dead() ? '   GAME OVER — press R' : '');
+
+    let shown = '';
+    function hud() {
+      const s = P._get_score(), h = P._get_hearts(), d = P._get_dead();
+      const key = s + ',' + h + ',' + d;
+      if (key === shown) return;           // touch the DOM only on change
+      shown = key;
+      msg.textContent = 'score ' + s;
+      [...lives.children].forEach((icon, i) => icon.classList.toggle('lost', i >= h));
+      lives.setAttribute('aria-label', h + ' of ' + MAX_HEARTS + ' lives');
+      over.textContent = d ? 'GAME OVER — press R' : '';
     }
-    // rAF is paused in occluded/background tabs; a watchdog keeps the game
-    // alive (and verifiable) when it stalls. Game clock is wall-time based,
-    // so tick rate only affects smoothness, not timing.
+
+    // One function advances and paints a frame. Only loop() schedules the next
+    // animation frame, so extra calls never start a second loop.
     const tickState = { last: 0 };
     window.__tickState = tickState;
-    function tick() {
+    let failed = false, timer = 0;
+    function draw() {
+      if (failed) return;
       try {
         const now = performance.now();
         tickState.last = now;
         P._frame(now);
         ctx.putImageData(new ImageData(view(), W, H), 0, 0);
-        hud2();
-        requestAnimationFrame(tick);
-      } catch (e) { report('FRAME', e); }
+        hud();
+      } catch (e) {
+        failed = true;
+        clearInterval(timer);
+        report('FRAME', e);
+      }
     }
-    requestAnimationFrame(tick);
-    // In headless/throttled tabs a single timer can be frozen by the browser;
-    // use several independent kickers + event-based revival so at least one
-    // restarts the loop. Game clock is wall-time based, so tick rate only
-    // affects smoothness, not timing.
+    function loop() {
+      draw();
+      if (!failed) requestAnimationFrame(loop);
+    }
+    // rAF is paused in occluded/background tabs; a watchdog keeps the game
+    // alive (and verifiable) when it stalls. Game clock is wall-time based,
+    // so tick rate only affects smoothness, not timing.
     function kick() {
-      if (tickState.last === 0 || performance.now() - tickState.last > 150) tick();
+      if (performance.now() - tickState.last > 150) draw();
     }
-    setInterval(kick, 50);
-    setInterval(kick, 200);
-    setInterval(kick, 1000);
+    requestAnimationFrame(loop);
+    timer = setInterval(kick, 50);
     document.addEventListener('visibilitychange', kick);
     window.addEventListener('focus', kick);
     window.addEventListener('pageshow', kick);
+
+    const MOVES = { arrowup: 0, w: 0, arrowright: 1, d: 1, arrowdown: 2, s: 2, arrowleft: 3, a: 3 };
+    // Movement keys currently down, newest last. The engine paces held walking,
+    // so the operating system's key repeat is ignored.
+    let down = [];
+    const holdNewest = () => P._hold(down.length ? MOVES[down[down.length - 1]] : -1);
+    function releaseAll() { down = []; P._hold(-1); }
+
     addEventListener('keydown', e => {
-      const k = e.key;
-      if (k === 'ArrowUp' || k === 'w') P._step(0);
-      else if (k === 'ArrowRight' || k === 'd') P._step(1);
-      else if (k === 'ArrowDown' || k === 's') P._step(2);
-      else if (k === 'ArrowLeft' || k === 'a') P._step(3);
-      else if (k === 'r' || k === 'R') P._init_game();
-      else { e.preventDefault(); return; }
-      // input may arrive while the render loop is stalled (occluded tab, frozen
-      // timers): refresh the frame + HUD immediately so a keystroke always
-      // has visible feedback.
-      kick();
+      if (e.ctrlKey || e.metaKey || e.altKey) return;   // leave browser shortcuts alone
+      const k = e.key.toLowerCase();
+      const move = Object.hasOwn(MOVES, k);
+      if (!move && k !== 'r') return;
       e.preventDefault();
+      if (failed || e.repeat) return;
+      if (move) {
+        draw();                  // bring the clock up to date: expired fuses blow first
+        P._step(MOVES[k]);
+        down = down.filter(other => other !== k).concat(k);
+        holdNewest();
+      } else {
+        releaseAll();
+        P._init_game();
+      }
+      draw();                    // every keystroke gets immediate visible feedback
     });
+    addEventListener('keyup', e => {
+      const k = e.key.toLowerCase();
+      if (!down.includes(k)) return;
+      down = down.filter(other => other !== k);
+      draw();
+      holdNewest();
+    });
+    // a keyup can be lost when focus leaves: never leave the farmer walking
+    addEventListener('blur', releaseAll);
+    document.addEventListener('visibilitychange', () => { if (document.hidden) releaseAll(); });
     window.__ready = true;
   } catch (err) { report('INIT', err); }
 })();
