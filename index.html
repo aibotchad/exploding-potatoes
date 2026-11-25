@@ -1,0 +1,88 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Exploding Potatoes</title>
+<style>
+  body { background: #0d0e14; display: flex; flex-direction: column; align-items: center; gap: 10px; font-family: monospace; color: #9aa3b8; }
+  canvas { image-rendering: pixelated; image-rendering: crisp-edges; border: 2px solid #232838; }
+  #hud { font-size: 14px; letter-spacing: 1px; }
+</style>
+</head>
+<body>
+<div id="hud">loading&hellip;</div>
+<canvas id="c" width="504" height="504"></canvas>
+<script src="potato.js"></script>
+<script>
+window.__pageerr = '';
+function report(tag, e) {
+  window.__pageerr = (e && e.stack || String(e)) + '';
+  var hud = document.getElementById('hud');
+  if (hud) hud.textContent = tag + ' FAIL: ' + (e && e.message || e);
+}
+(async () => {
+  try {
+    const P = await createPotato();
+    window.__P = P;  // debug/test handle
+    const W = P._game_w(), H = P._game_h();
+    const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+    const hud = document.getElementById('hud');
+    P._init_game();
+    // The C framebuffer is a static array at a fixed heap offset — _game_buf() returns it.
+    const base = P._game_buf() | 0, n = W * H * 4;
+    const view = () => new Uint8ClampedArray(P.HEAPU8.buffer, base, n);
+    function hud2() {
+      const h = P._get_hearts();
+      hud.textContent = 'score ' + P._get_score() + '   ' +
+        '\u{1F954}'.repeat(h) + '\u00B7'.repeat(3 - h) +
+        (P._get_dead() ? '   GAME OVER — press R' : '');
+    }
+    // rAF is paused in occluded/background tabs; a watchdog keeps the game
+    // alive (and verifiable) when it stalls. Game clock is wall-time based,
+    // so tick rate only affects smoothness, not timing.
+    const tickState = { last: 0 };
+    window.__tickState = tickState;
+    function tick() {
+      try {
+        const now = performance.now();
+        tickState.last = now;
+        P._frame(now);
+        ctx.putImageData(new ImageData(view(), W, H), 0, 0);
+        hud2();
+        requestAnimationFrame(tick);
+      } catch (e) { report('FRAME', e); }
+    }
+    requestAnimationFrame(tick);
+    // In headless/throttled tabs a single timer can be frozen by the browser;
+    // use several independent kickers + event-based revival so at least one
+    // restarts the loop. Game clock is wall-time based, so tick rate only
+    // affects smoothness, not timing.
+    function kick() {
+      if (tickState.last === 0 || performance.now() - tickState.last > 150) tick();
+    }
+    setInterval(kick, 50);
+    setInterval(kick, 200);
+    setInterval(kick, 1000);
+    document.addEventListener('visibilitychange', kick);
+    window.addEventListener('focus', kick);
+    window.addEventListener('pageshow', kick);
+    addEventListener('keydown', e => {
+      const k = e.key;
+      if (k === 'ArrowUp' || k === 'w') P._step(0);
+      else if (k === 'ArrowRight' || k === 'd') P._step(1);
+      else if (k === 'ArrowDown' || k === 's') P._step(2);
+      else if (k === 'ArrowLeft' || k === 'a') P._step(3);
+      else if (k === 'r' || k === 'R') P._init_game();
+      else { e.preventDefault(); return; }
+      // input may arrive while the render loop is stalled (occluded tab, frozen
+      // timers): refresh the frame + HUD immediately so a keystroke always
+      // has visible feedback.
+      kick();
+      e.preventDefault();
+    });
+    window.__ready = true;
+  } catch (err) { report('INIT', err); }
+})();
+</script>
+</body>
+</html>
