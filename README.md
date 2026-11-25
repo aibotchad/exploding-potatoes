@@ -2,10 +2,19 @@
 
 A tiny survival game written in C, compiled to WebAssembly, rendered as raw
 pixels into a canvas. You are the farmer. Fused potatoes spawn
-around the grid, each with a countdown ring: step onto one to defuse it (+1), or stay out of its 5×5 blast
-(you have 3 hearts). Survive, rack up score, restart with **R**.
+around the grid, each with a countdown ring: step onto one to defuse it, or stay out of its blast
+(you have 3 hearts). A round lasts one minute and potatoes come faster as the
+clock runs: score high enough to make the top ten. Restart with **R**.
 
 ![controls](https://img.shields.io/badge/controls-arrows%20%C2%B7%20R-2ea043)
+
+## Potatoes
+
+| Size   | Points | Blast | Share |
+| ------ | ------ | ----- | ----- |
+| Small  | 1      | 3×3   | 50%   |
+| Medium | 3      | 5×5   | 35%   |
+| Big    | 5      | 7×7   | 15%   |
 
 ## Play
 
@@ -17,8 +26,12 @@ python3 -m http.server 8080
 # then visit http://localhost:8080
 ```
 
+Needs a browser with WebAssembly SIMD (Chrome 91+, Firefox 89+, Safari 16.4+).
+
 - **Arrows / WASD** — tap to move one cell, hold to keep walking
 - **R** — restart
+
+The clock starts on your first move. The top ten is saved in that browser only.
 
 Screen shake and flash are turned off when the system asks for reduced motion.
 
@@ -34,7 +47,7 @@ source /path/to/emsdk/emsdk_env.sh
 The committed `potato.js` / `potato.wasm` are current builds — commit them if
 you rebuild.
 
-The potato photo and farmer sprite sheet are baked into `src/sprites.h`. After changing anything in
+The potato photo, farmer sprite sheet and field tiles are baked into `src/sprites.h`. After changing anything in
 `assets/`, regenerate it (needs [Pillow](https://python-pillow.org/)):
 
 ```sh
@@ -57,18 +70,22 @@ node test_node.js
 | -------------- | --------------------------------------------------- |
 | `src/potato.c` | Game in C: logic, spawner, collisions, particles, pixel render |
 | `src/sprites.h` | Generated sprite pixels                            |
-| `assets/`      | Potato photo, farmer sheet, [credits](assets/CREDITS.md) |
+| `assets/`      | Potato, farmer and field art, [credits](assets/CREDITS.md) |
 | `tools/make_sprites.py` | `assets/` → `src/sprites.h`                |
 | `build.sh`     | Emscripten build                                    |
+| `scores.js`    | Top-ten ranking                                     |
 | `potato.js`    | Emscripten glue (MODULARIZE, factory `createPotato`) |
 | `potato.wasm`  | Compiled WASM module                                 |
-| `index.html`   | Browser shell: canvas blit, HUD, input, watchdog    |
+| `index.html`   | Browser shell: canvas, timer, screens, input        |
 | `test_node.js` | Node test harness for the same WASM module           |
 
 ## Design notes
 
 - The engine owns the canvas: it renders straight into a WebAssembly memory
-  buffer (`_game_buf`, RGBA) that JS blits with `putImageData`.
+  buffer (RGBA) that JS blits with `putImageData`. Drawing is lazy: state changes
+  mark the picture stale and `_game_buf()` draws it.
+- Movement rules are per cell; the glide is drawing only and never trails more
+  than one step behind the input.
 - Time is wall-clock (`performance.now()`), so the game advances in real time
   even in a throttled background tab; input events force an immediate
   render+HUD refresh so a stale frame can never be left on screen.

@@ -79,7 +79,7 @@ async function main() {
   P._init_game(); P._frame(1000);
   const x0 = capX();
   P._step(1);
-  const xs = [1033, 1066, 1099, 1140].map((now) => { P._frame(now); return capX(); });
+  const xs = [1025, 1050, 1075, 1120].map((now) => { P._frame(now); return capX(); });
   ok(xs[0] > x0 && xs.every((x, i) => i === 0 || x > xs[i - 1]), 'a step glides across frames (' + [x0, ...xs].map(Math.round).join(' ') + ')');
   P._frame(1300);
   ok(Math.abs(capX() - xs[3]) < 6, 'glide stops on the next cell');
@@ -102,13 +102,58 @@ async function main() {
   ok(Math.abs(capX() - x0) < 1, 'restart cancels a held key');
   P._init_game(); P._frame(1000);
 
+  console.log('--- turning has no delay ---');
+  // time from the key press until the farmer enters the new cell (shown by a defuse)
+  const turnTime = (cell, setup) => {
+    let now = 1000; P._init_game(); P._frame(now);
+    const run = (to) => { while (now < to) P._frame(++now); };
+    const press = setup(run);
+    const s = P._get_score(), t0 = now;
+    P._set_potato(cell[0], cell[1], 100000);
+    press();
+    while (P._get_score() === s && now - t0 < 600) run(now + 1);
+    return now - t0;
+  };
+  const walkRight = (until) => (run) => { P._step(1); P._hold(1); run(until); return () => { P._step(0); P._hold(0); }; };
+  const justAfter = turnTime([cx + 3, cy - 1], walkRight(1310));   // 20 ms after a held step
+  ok(justAfter === 0, 'turning right after a walking step is instant (' + justAfter + ' ms)');
+  const back = turnTime([cx + 4, cy - 2], (run) => {
+    P._step(0); P._hold(0); run(1050); P._step(1); P._hold(1); run(1470);
+    return () => P._hold(0);                                        // let go of right, still holding up
+  });
+  ok(back <= 100, 'falling back to a still-held key keeps the walking pace (' + back + ' ms)');
+  P._init_game(); P._frame(1000);
+  P._step(1); P._hold(1); P._frame(1050); P._step(0); P._hold(0); P._frame(1100); P._hold(-1); P._frame(1600);
+  P._set_potato(cx + 1, cy - 2, 100000);
+  const before = P._get_score(); P._step(0);
+  ok(P._get_score() === before + 3, 'two quick overlapping taps move one cell each');
+
+  console.log('--- tight controls ---');
+  // fast taps: the farmer is never drawn more than one cell behind the rules
+  P._init_game(); P._frame(1000);
+  const home = capX();
+  for (let i = 0; i < 6; i++) P._press(1010 + i * 30, 1);
+  P._hold(-1); P._frame(1161);
+  ok(capX() - home >= 5 * 32 - 4, 'rapid taps do not build up lag (' + ((capX() - home) / 32).toFixed(1) + ' of 6 cells drawn)');
+  P._frame(1260);
+  const arrived = capX(); P._frame(1600);
+  ok(Math.abs(arrived - home - 6 * 32) < 6 && capX() === arrived, 'stops dead within one step of the last tap');
+  // a held step falling due at the moment of a new press must not happen
+  P._init_game(); P._frame(1000);
+  P._press(1000, 1); P._frame(1150);                   // walking: next step due at 1250
+  P._set_potato(cx + 3, cy, 100000);
+  const s1 = P._get_score();
+  P._press(1255, 0);
+  ok(P._get_score() === s1, 'the old direction gets no extra step on a turn');
+  P._init_game(); P._frame(1000);
+
   console.log('--- defuse: step onto a potato scores ---');
   const s0 = P._get_score();
   P._set_potato(cx + 1, cy, 100000);   // right of player, long fuse
   P._frame(1010);
   ok(hasColorNear(P, cx + 1, cy, [0xe8, 0xc5, 0x47]), 'spawned potato rendered (yellow, young fuse)');
   const s = P._step(1);                // step right
-  ok(P._get_score() === s0 + 1, 'stepping onto potato scores (score ' + s0 + ' -> ' + P._get_score() + ')');
+  ok(P._get_score() === s0 + 3, 'stepping onto a medium potato scores 3 (score ' + s0 + ' -> ' + P._get_score() + ')');
   P._frame(1160);                        // let the glide finish
   ok(hasColorNear(P, cx + 1, cy, CAP), 'farmer now on defused cell');
 
@@ -194,7 +239,7 @@ async function main() {
   P._frame(27000);
   for (let i = 0; i < 9; i++) P._set_potato(i * 2 + 1, i % 2 ? 0 : 20, 50);   // edges, all at once
   for (let t = 27100; t < 27600; t += 16) P._frame(t);
-  ok(P._get_particles() <= 2048, 'pool stays bounded with many edge blasts');
+  ok(P._get_particles() <= 3072, 'pool stays bounded with many edge blasts');
   P._set_reduced_motion(1);
   P._set_potato(0, 0, 10);
   P._frame(27650);
@@ -226,7 +271,7 @@ async function main() {
   P._step(99); P._step(-1);
   P._set_potato(cx + 1, cy, 100000);
   P._step(1);
-  ok(P._get_score() === 1, 'invalid directions do not use up the step cooldown');
+  ok(P._get_score() === 3, 'invalid directions are ignored');
   P._init_game();
   P._frame(1000);
   for (let i = 0; i < 30; i++) { P._frame(1100 + i * 60); P._step(3); }
@@ -234,6 +279,116 @@ async function main() {
   P._frame(4000);
   P._step(3);                           // x is 0 if the wall held, so nothing at x=1
   ok(P._get_score() === 0, 'walls block movement');
+
+  console.log('--- one-minute round ---');
+  P._init_game();
+  ok(P._get_time_left() === 60000 && P._get_over() === 0, 'clock shows 1:00 before the first frame');
+  P._frame(1000);
+  P._frame(31000);
+  ok(P._get_time_left() === 30000, 'half the time left at 30 s');
+  P._init_game(); P._frame(1000); P._frame(60900);
+  P._init_game(); P._frame(1000);
+  // a potato defused just before the buzzer counts, one stepped on after it does not
+  P._frame(60990);
+  const alive = !P._get_dead();
+  P._set_potato(cx + 1, cy, 100000); P._step(1);
+  const atBuzzer = P._get_score();
+  P._frame(61000);
+  ok(alive && P._get_over() === 1 && P._get_time_left() === 0, 'round ends at 60 s');
+  P._set_potato(cx + 2, cy, 100000);
+  P._step(1); P._press(61100, 1); P._frame(62000);
+  ok(atBuzzer === 3 && P._get_score() === 3, 'no moving or scoring after time is up');
+  P._init_game();
+  ok(P._get_over() === 0 && P._get_time_left() === 60000, 'restart resets the clock');
+  P._frame(1000); P._press(1000, 1); P._frame(60900); P._frame(70000);
+  const held0 = P._get_particles();
+  ok(P._get_over() === 1 && P._get_potatoes() === 0 && held0 === 0, 'field is cleared at the buzzer, nothing blows later');
+  // a fuse that ran out before the buzzer still explodes, even if the frame is late
+  P._init_game(); P._frame(1000); P._frame(60000);
+  P._set_potato(0, 0, 500);                          // due at 59.5 s
+  P._frame(65000);
+  ok(P._get_particles() > 0, 'late frame still explodes fuses that expired in time');
+
+  console.log('--- potato sizes ---');
+  const SIZES = ['small', 'medium', 'big'], WORTH = [1, 3, 5], REACH = [1, 2, 3], bursts = [];
+  for (let z = 0; z < 3; z++) {
+    P._init_game(); P._frame(1000);
+    P._set_sized_potato(cx + 1, cy, 100000, z); P._step(1);
+    ok(P._get_score() === WORTH[z] && P._get_defused() === 1, SIZES[z] + ' potato is worth ' + WORTH[z]);
+    const hit = (dist) => {
+      P._init_game(); P._frame(1000);
+      P._set_sized_potato(cx + dist, cy + dist, 50, z); P._frame(1100);
+      return P._get_hearts() < 3;
+    };
+    ok(hit(REACH[z]) && !hit(REACH[z] + 1), SIZES[z] + ' blast reaches exactly ' + REACH[z] + ' cells');
+    P._init_game(); P._frame(1000);
+    P._set_sized_potato(3, 3, 50, z); P._frame(1100);
+    bursts.push(P._get_particles());
+  }
+  ok(bursts[0] < bursts[1] && bursts[1] < bursts[2], 'bigger potato, bigger explosion (' + bursts.join(' < ') + ' particles)');
+  // how much of the board the ring covers, and how far the screen is thrown about
+  const ringArea = (z) => {
+    P._init_game(); P._frame(1000);
+    const plain = P.HEAPU8.slice(P._game_buf(), P._game_buf() + 672 * 672 * 4);
+    P._set_sized_potato(4, 4, 100000, z); P._frame(1001);
+    const now = P._game_buf(); let n = 0;
+    for (let i = 0; i < plain.length; i += 4) if (P.HEAPU8[now + i] !== plain[i]) n++;
+    return n;
+  };
+  const areas = [0, 1, 2].map(ringArea);
+  ok(areas[0] < areas[1] && areas[1] < areas[2], 'bigger potatoes look bigger (' + areas.join(' < ') + ' px)');
+  P._init_game(); P._frame(1000);
+  P._set_sized_potato(1, 1, 100, 3); P._set_sized_potato(1, 1, 100, -1);
+  ok(P._get_potatoes() === 0, 'unknown sizes are rejected');
+  const seenSizes = [0, 0, 0];
+  for (let game = 0; game < 30; game++) {
+    P._init_game(); const t0 = 1000 + game * 61000; P._frame(t0); P._frame(t0 + 800);
+    for (let i = 0; i < 20; i++) if (P._potato_size(i) >= 0) seenSizes[P._potato_size(i)]++;
+  }
+  ok(seenSizes.every((n) => n > 0) && seenSizes[0] > seenSizes[2], 'all sizes spawn, big ones rarest (' + seenSizes.join(' / ') + ')');
+
+  console.log('--- more potatoes as time goes on ---');
+  const times = [0, 15000, 30000, 45000, 60000];
+  const rising = (f, dir) => times.map(f).every((v, i, a) => i === 0 || dir * (v - a[i - 1]) > 0);
+  ok(rising((t) => P._potato_cap(t), 1), 'more allowed on the field (' + times.map((t) => P._potato_cap(t)).join(' ') + ')');
+  ok(rising((t) => P._spawn_gap(t), -1), 'they arrive faster (' + times.map((t) => P._spawn_gap(t)).join(' ') + ' ms)');
+  ok(rising((t) => P._fuse_length(t), -1), 'fuses get shorter (' + times.map((t) => P._fuse_length(t)).join(' ') + ' ms)');
+  let early = 0, late = 0, overCap = 0;
+  for (let game = 0; game < 40; game++) {
+    P._init_game(); const t0 = 1000 + game * 61000; P._frame(t0);
+    for (let t = 100; t < 60000 && !P._get_over(); t += 100) {
+      P._frame(t0 + t);
+      const n = P._get_potatoes();
+      if (n > P._potato_cap(t)) overCap++;
+      if (t < 10000) early = Math.max(early, n); else if (t > 45000) late = Math.max(late, n);
+    }
+  }
+  ok(overCap === 0 && late >= early + 4, 'busier at the end than the start (peak ' + early + ' -> ' + late + ')');
+
+  console.log('--- top ten ---');
+  const createScoreboard = require(path.join(__dirname, 'scores.js'));
+  const store = (data = {}) => ({ data, getItem: (k) => (k in data ? data[k] : null), setItem: (k, v) => { data[k] = String(v); } });
+  const disk = store(), board = createScoreboard(disk);
+  ok(board.list().length === 0 && !board.qualifies(0) && board.qualifies(1), 'empty board takes any score above zero');
+  for (let i = 1; i <= 12; i++) board.add('p' + i, i);
+  const top = board.list();
+  ok(top.length === 10 && top[0].score === 12 && top[9].score === 3, 'keeps the best ten in order');
+  ok(!board.qualifies(3) && board.qualifies(4) && board.add('low', 2) === -1, 'must beat tenth place');
+  ok(board.add('tie', 12) === 1, 'a tie ranks below the earlier score');
+  ok(createScoreboard(disk).list()[1].name === 'TIE' && createScoreboard(disk).lastName() === 'TIE', 'survives a reload');
+  board.add('  a very   long name ', 99); board.add('   ', 98);
+  ok(board.list()[0].name === 'A VERY L' && board.list()[1].name === 'FARMER', 'names are trimmed, capped and defaulted');
+  for (const bad of ['not json', '{}', 'null', '[1,null,{"name":5,"score":3},{"name":"x","score":"9"}]']) {
+    const b = createScoreboard(store({ 'exploding-potatoes.top10.v1': bad }));
+    if (b.list().length !== 0 || b.add('ok', 5) !== 0) ok(false, 'damaged data: ' + bad);
+  }
+  ok(true, 'damaged saved data is ignored');
+  const broken = { getItem() { throw new Error('blocked'); }, setItem() { throw new Error('blocked'); } };
+  const full = { ...store({ 'exploding-potatoes.top10.v1': '[{"name":"OLD","score":1}]' }), setItem() { throw new Error('quota'); } };
+  for (const [label, s] of [['no storage', null], ['blocked storage', broken], ['full storage', full]]) {
+    const b = createScoreboard(s); b.add('me', 7);
+    ok(b.list()[0].score === 7, label + ': still ranks for this visit');
+  }
 
   console.log('--- auto-spawn + soak ---');
   P._init_game();

@@ -1,13 +1,13 @@
 /* Exploding Potatoes — compiled to WebAssembly with emscripten.
  *
  * You are a farmer. Fused potatoes keep spawning on the grid — step onto
- * one to defuse it (+1 point). Every potato you miss detonates, blasting
- * its 5x5 neighborhood: other potatoes in the blast are cleared, and if
- * you are in the blast you lose a heart. Three hearts, and the fuses get
- * shorter and the spawns faster as you score.
+ * one to defuse it. They come in three sizes: bigger ones score more (1, 3, 5)
+ * and blast further (3x3, 5x5, 7x7). Every potato you miss detonates, blasting
+ * its neighborhood: other potatoes in the blast are cleared, and if
+ * you are in the blast you lose a heart. You have three hearts.
  *
- * Potato photos and the farmer sprite sheet are baked into sprites.h
- * (see assets/CREDITS.md).
+ * The potato photo, farmer sprite sheet and field tiles are baked into
+ * sprites.h (see assets/CREDITS.md).
  * Explosions drive a particle system (fire, smoke, sparks, potato chunks)
  * plus a shockwave, screen flash and screen shake.
  *
@@ -16,12 +16,21 @@
  * movement is event-driven (_step), fuses/spawns/explosions run on the
  * wall clock passed to _frame.
  *
+ * A round lasts one minute from the first frame: score as much as you can.
+ * Potatoes arrive faster, in greater numbers and with shorter fuses as the
+ * clock runs, on the same schedule for every player.
+ *
  * Exports: init_game() step(int d) set_potato(int x, int y, double fuse_ms)
  *          frame(double now_ms) get_score() get_hearts() get_dead()
- *          hold(int d) get_particles() set_reduced_motion(int on)
+ *          press(double now_ms, int d) hold(int d)
+ *          get_particles() set_reduced_motion(int on)
+ *          get_time_left() get_over() get_potatoes()
+ *          potato_cap(double ms) spawn_gap(double ms) fuse_length(double ms)
+ *          set_sized_potato(x, y, fuse_ms, size) potato_size(i) get_defused()
  *          game_buf() game_w() game_h()
  */
 #include <emscripten.h>
+#include <wasm_simd128.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
@@ -33,58 +42,77 @@
 #define W (GRID * CELL)
 #define H (GRID * CELL)
 
-#define MAXPOT   9
-#define MAXBLAST 9
-#define MAXPART  2048
+#define MAXPOT   20
+#define MAXBLAST 20
+#define ROUND_MS 60000.0
+/* start of the round -> final second */
+#define CAP_END    18         /* potatoes on the field at once (starts at 4) */
+#define GAP_START  1400.0     /* ms between spawns */
+#define GAP_END    300.0
+#define FUSE_START 5500.0     /* ms from spawn to boom */
+#define FUSE_END   3800.0
+#define MAXPART  3072
 #define MAXHEARTS 3
-#define BLAST_MS   450.0
-#define FLASH_MS   130.0
-#define SHAKE_MS   380.0
-#define SHAKE_PX   11.0
-#define STEP_MIN_MS 50.0
-#define MOVE_MS    130.0     /* glide time for one cell; also the held-key pace */
-#define HOLD_DELAY_MS 160.0  /* a held key starts repeating after this */
-#define TIMER_R    26         /* countdown ring: outer radius and width, px */
-#define TIMER_W    4
-#define BLAST_R    2          /* chebyshev radius of a boom: 5x5 cells */
+#define MOVE_MS    100.0     /* glide time for one cell; also the held-key pace */
+#define HOLD_DELAY_MS 150.0  /* a held key starts repeating after this */
+#define TIMER_W    4          /* countdown ring width, px */
 
 /* colors (24-bit) */
-#define BGTOPC   0x000000    /* background gradient: black ... */
-#define BGBOTC   0x1c3a63    /* ... down to brown */
-#define GLOWC    0x96dcff    /* soft light around the farmer (const = BBGGRR, byte0 = R) */
-#define PUTC1    0x47c5e8    /* fuse young: yellow */
+#define PUTC1    0x47c5e8    /* fuse young: yellow (const = BBGGRR, byte0 = R) */
 #define PUTC2    0x397be0    /* fuse mid: orange */
 #define PUTC3    0x4545d6    /* fuse short: red */
 #define SPARKC   0xb0f2ff
-#define TRACKC   0xffffff    /* burnt part of the countdown ring */
-#define WAVEC    0x8ce1ff    /* shockwave */
+#define TRACKC   0x141928    /* dark outline and burnt part of the countdown ring */
+#define WAVEC    0xf0fcff    /* shockwave */
 #define FLASHC   0xa0dcff
 
-static uint8_t pixels[W * H * 4];
+/* Everything that changes with a potato's size. */
+enum { SMALL, MEDIUM, BIG, SIZES };
+typedef struct {
+    int points, reach;                     /* score; blast = chebyshev radius */
+    int ring;                              /* countdown ring radius, px */
+    int smoke, fire, chunk, spark;         /* particles per explosion */
+    float speed, grain;                    /* particle speed and size factors */
+    double blast_ms, flash_ms, shake_ms;
+    double shake_px;
+    int flash_a;
+} potsize_t;
+static const potsize_t SIZE_OF[SIZES] = {
+    /*  pts reach ring  smoke fire chunk spark  speed grain  blast flash shake  px  alpha */
+    { 1, 1, 20,   18,  34, 12,  40,   0.62f, 0.75f,  340, 100, 260,  5.0,  70 },
+    { 3, 2, 26,   40,  80, 30,  90,   1.00f, 1.00f,  450, 130, 380, 11.0, 120 },
+    { 5, 3, 33,   65, 140, 55, 170,   1.38f, 1.35f,  650, 180, 560, 21.0, 150 },
+};
+
+static _Alignas(16) uint8_t pixels[W * H * 4];
 
 static int px_ = GRID / 2, py_ = GRID / 2;   /* player cell */
-static int dead = 0;
+static int dead = 0;                         /* out of hearts */
+static int time_up = 0;                      /* the minute ran out */
 static int facing = 2;                       /* 0 up, 1 right, 2 down, 3 left */
 static int stride = 0;                       /* alternates the two walk frames */
 static double from_x = 0.0, from_y = 0.0;    /* glide start, in cells */
 static double move_t0 = -1e9;                /* glide start time, game ms */
 static int held = -1;                        /* direction being held, -1 none */
 static double next_hold = 0.0;               /* game ms of the next held step */
+static int defused = 0;                      /* potatoes defused this round */
+static int walking = 0;                      /* has the held key started repeating? */
 static int hearts = MAXHEARTS;
 static int score = 0;
 
 static uint8_t p_on[MAXPOT];
 static int     p_x[MAXPOT], p_y[MAXPOT];
+static uint8_t p_size[MAXPOT];
 static double  p_t0[MAXPOT], p_dead[MAXPOT];   /* spawn / fuse deadline (game ms) */
 
 static uint8_t b_on[MAXBLAST];
 static int     b_x[MAXBLAST], b_y[MAXBLAST];
+static uint8_t b_size[MAXBLAST];
 static double  b_t0[MAXBLAST];
 
 static int started = 0;                      /* has frame() primed the clock? */
 static double start_ms = 0.0;
 static double last_now = 0.0;
-static double last_step_ms = -1e9;
 static double next_spawn = 0.0;
 static uint32_t rng_state = 0xb09f5eedu;
 static uint32_t fx_state = 0x1234abcdu;     /* effects only: never disturbs spawns */
@@ -100,6 +128,12 @@ static int part_next = 0;                    /* ring cursor: full pool recycles 
 
 static int reduced_motion = 0;               /* no shake / flash */
 static int ox = 0, oy = 0;                   /* screen shake offset */
+static double draw_t = 0.0;                  /* game time the next picture shows */
+static int dirty = 1;                        /* state changed since the last draw */
+
+/* State changes only mark the picture stale; game_buf() draws it. A key press
+ * that advances, steps and re-paths therefore costs one draw, not several. */
+static void invalidate(double t) { draw_t = t; dirty = 1; }
 
 static uint32_t rng(void) {
     rng_state ^= rng_state << 13;
@@ -120,45 +154,25 @@ static void blendpx(int x, int y, uint32_t c, int a) {      /* a: 0..255 */
     x += ox; y += oy;
     if (x < 0 || x >= W || y < 0 || y >= H || a <= 0) return;
     if (a > 255) a = 255;
-    uint8_t *p = &pixels[(y * W + x) * 4];
-    for (int k = 0; k < 3; k++) {
-        int src = (c >> (8 * k)) & 0xff;
-        p[k] = (uint8_t)((p[k] * (255 - a) + src * a) / 255);
-    }
-    p[3] = 255;
+    uint8_t *p = &pixels[(y * W + x) * 4];     /* alpha byte is already 255 */
+    int w = a + (a >> 7), v = 256 - w;         /* 0..256, so blending is a shift */
+    p[0] = (uint8_t)((p[0] * v + (int)(c & 0xff) * w) >> 8);
+    p[1] = (uint8_t)((p[1] * v + (int)((c >> 8) & 0xff) * w) >> 8);
+    p[2] = (uint8_t)((p[2] * v + (int)((c >> 16) & 0xff) * w) >> 8);
 }
-static void addpx(int x, int y, uint32_t c, int a) {        /* additive glow */
-    x += ox; y += oy;
-    if (x < 0 || x >= W || y < 0 || y >= H || a <= 0) return;
-    if (a > 255) a = 255;
-    uint8_t *p = &pixels[(y * W + x) * 4];
-    for (int k = 0; k < 3; k++) {
-        int v = p[k] + (int)((c >> (8 * k)) & 0xff) * a / 255;
-        p[k] = (uint8_t)(v > 255 ? 255 : v);
-    }
-}
-/* vertical gradient, with 2x2 ordered dithering to hide color banding */
-static uint32_t bg_at(int x, int y) {
-    static const int dither[4] = { 0, 2, 3, 1 };
-    int d = dither[(x & 1) | ((y & 1) << 1)];
-    y = y < 0 ? 0 : y >= H ? H - 1 : y;               /* screen shake looks past edges */
-    uint32_t c = 0;
-    for (int k = 0; k < 3; k++) {
-        int a = (BGTOPC >> (8 * k)) & 0xff, b = (BGBOTC >> (8 * k)) & 0xff;
-        int v4 = a * 4 + (b - a) * 4 * y / (H - 1);   /* in quarter steps */
-        c |= (uint32_t)((v4 + d) / 4) << (8 * k);
-    }
-    return c;
-}
-
 static int potcount(void) {
     int i, n = 0;
     for (i = 0; i < MAXPOT; i++) n += p_on[i];
     return n;
 }
-static int maxpot(void)  { int m = 5 + score / 8;      return m > MAXPOT ? MAXPOT : m; }
-static double spawnevery(void) { double v = 2000.0 - 30.0 * score; return v < 800.0 ? 800.0 : v; }
-static double fuse_for(void)   { double v = 4500.0 - 120.0 * score; return v < 2200.0 ? 2200.0 : v; }
+/* Difficulty depends only on the round clock, never on how well you play. */
+static double progress(double t) { return t < 0 ? 0 : t > ROUND_MS ? 1 : t / ROUND_MS; }
+EMSCRIPTEN_KEEPALIVE
+int potato_cap(double t)     { return 4 + (int)(progress(t) * (CAP_END - 4)); }
+EMSCRIPTEN_KEEPALIVE
+double spawn_gap(double t)   { return GAP_START - (GAP_START - GAP_END) * progress(t); }
+EMSCRIPTEN_KEEPALIVE
+double fuse_length(double t) { return FUSE_START - (FUSE_START - FUSE_END) * progress(t); }
 static int absv(int a) { return a < 0 ? -a : a; }
 
 /* --------------------------------------------------------------- particles */
@@ -172,7 +186,7 @@ static float frand(float lo, float hi) {
 
 /* a random opaque pixel of the bomb photo, so debris looks like the potato */
 static uint32_t chunk_color(void) {
-    const sprite_t *s = &BOMB_SPR[BOMB_FRAMES - 1];
+    const sprite_t *s = &BOMB_SPR[BIG][BOMB_FRAMES - 1];
     for (int tries = 0; tries < 16; tries++) {
         int x = (int)frand(0, (float)s->w - 0.01f), y = (int)frand(0, (float)s->h - 0.01f);
         const uint8_t *p = &s->px[(y * s->w + x) * 4];
@@ -196,24 +210,27 @@ static void emit(int kind, int count, float cx, float cy,
     }
 }
 
-static void burst(float cx, float cy) {
-    emit(P_SMOKE, 40, cx, cy, 15.0f, 130.0f, 0.9f, 1.8f,  9.0f, 16.0f);
-    emit(P_FIRE,  80, cx, cy, 20.0f, 290.0f, 0.3f, 0.8f,  6.0f, 15.0f);
-    emit(P_CHUNK, 30, cx, cy, 80.0f, 340.0f, 0.8f, 1.4f,  3.0f,  9.0f);
-    emit(P_SPARK, 90, cx, cy, 150.0f, 520.0f, 0.3f, 0.9f, 1.0f,  2.0f);
+static void burst(float cx, float cy, const potsize_t *z) {
+    float v = z->speed, g = z->grain;
+    emit(P_SMOKE, z->smoke, cx, cy, 15 * v, 130 * v, 0.9f, 1.8f * g + 0.1f,  9 * g, 16 * g);
+    emit(P_FIRE,  z->fire,  cx, cy, 20 * v, 290 * v, 0.3f, 0.8f * g,         6 * g, 15 * g);
+    emit(P_CHUNK, z->chunk, cx, cy, 80 * v, 340 * v, 0.8f, 1.4f,             3 * g,  9 * g);
+    emit(P_SPARK, z->spark, cx, cy, 150 * v, 520 * v, 0.3f, 0.9f,            1.0f,   2.0f);
 }
 
 static void update_particles(double dt_ms) {
     float dt = (float)(dt_ms / 1000.0);
     float h = dt > 0.05f ? 0.05f : dt;       /* a stalled tab must not fling particles */
+    static const float drag[] = { [P_SMOKE] = 2.2f, [P_FIRE] = 4.0f,
+                                  [P_CHUNK] = 1.2f, [P_SPARK] = 3.0f };
+    float decay[P_SPARK + 1];
+    for (int kind = P_SMOKE; kind <= P_SPARK; kind++) decay[kind] = expf(-drag[kind] * h);
     for (int i = 0; i < MAXPART; i++) {
         part_t *q = &part[i];
         if (q->kind == P_NONE) continue;
         q->age += dt;
         if (q->age >= q->life) { q->kind = P_NONE; continue; }
-        float drag = q->kind == P_FIRE ? 4.0f : q->kind == P_SPARK ? 3.0f
-                   : q->kind == P_SMOKE ? 2.2f : 1.2f;
-        float k = expf(-drag * h);
+        float k = decay[q->kind];
         q->vx *= k; q->vy *= k;
         if (q->kind == P_CHUNK)      q->vy += 520.0f * h;
         else if (q->kind == P_SPARK) q->vy += 200.0f * h;
@@ -222,18 +239,71 @@ static void update_particles(double dt_ms) {
     }
 }
 
-/* soft round blob: alpha falls off from the center */
+/* soft round blob: alpha falls off from the center. The hottest loop in a big
+ * explosion, so it clips each row once and paints four pixels at a time. The
+ * one-pixel tail does the same integer math, so both give identical results. */
 static void blob(float cx, float cy, float r, uint32_t col, int a, int additive) {
     int h = (int)r + 1, ix = (int)cx, iy = (int)cy;
-    float r2 = r * r;
-    for (int dy = -h; dy <= h; dy++)
-        for (int dx = -h; dx <= h; dx++) {
-            float d = (float)(dx * dx + dy * dy);
-            if (d >= r2) continue;
-            int aa = (int)((float)a * (1.0f - d / r2));
-            if (additive) addpx(ix + dx, iy + dy, col, aa);
-            else          blendpx(ix + dx, iy + dy, col, aa);
+    float r2 = r * r, scale = (float)a / r2;
+    int cr = col & 0xff, cg = (col >> 8) & 0xff, cb = (col >> 16) & 0xff;
+    /* two RGBA pixels as 16-bit lanes; this alpha keeps the picture opaque */
+    const v128_t rgba = wasm_u16x8_make(cr, cg, cb, additive ? 0 : 255,
+                                        cr, cg, cb, additive ? 0 : 255);
+    for (int dy = -h; dy <= h; dy++) {
+        float left = r2 - (float)(dy * dy);
+        int y = iy + dy + oy;
+        if (left <= 0.0f || y < 0 || y >= H) continue;
+        int span = (int)sqrtf(left), mid = ix + ox;
+        int x = mid - span < 0 ? 0 : mid - span;
+        int x1 = mid + span >= W ? W - 1 : mid + span;
+        uint8_t *p = &pixels[(y * W + x) * 4];
+        for (; x + 3 <= x1; x += 4, p += 16) {
+            v128_t dx = wasm_i32x4_add(wasm_i32x4_splat(x - mid), wasm_i32x4_make(0, 1, 2, 3));
+            v128_t fall = wasm_f32x4_sub(wasm_f32x4_splat(left),
+                              wasm_f32x4_convert_i32x4(wasm_i32x4_mul(dx, dx)));
+            v128_t aa = wasm_i32x4_trunc_sat_f32x4(wasm_f32x4_mul(wasm_f32x4_splat(scale), fall));
+            aa = wasm_v128_and(aa, wasm_i32x4_gt(aa, wasm_i32x4_splat(3)));  /* too faint: 0 */
+            aa = wasm_i32x4_min(aa, wasm_i32x4_splat(255));
+            v128_t a16 = wasm_i16x8_narrow_i32x4(aa, aa);
+            v128_t src = wasm_v128_load(p), out[2];
+            for (int half = 0; half < 2; half++) {
+                v128_t al = half ? wasm_i16x8_shuffle(a16, a16, 2, 2, 2, 2, 3, 3, 3, 3)
+                                 : wasm_i16x8_shuffle(a16, a16, 0, 0, 0, 0, 1, 1, 1, 1);
+                v128_t px = half ? wasm_u16x8_extend_high_u8x16(src)
+                                 : wasm_u16x8_extend_low_u8x16(src);
+                if (additive) {                        /* px + col * a / 255 */
+                    v128_t m = wasm_i16x8_mul(rgba, al);
+                    m = wasm_i16x8_add(wasm_i16x8_add(m, wasm_i16x8_splat(1)),
+                                       wasm_u16x8_shr(m, 8));
+                    out[half] = wasm_i16x8_add(px, wasm_u16x8_shr(m, 8));
+                } else {                               /* (px * (256-w) + col * w) >> 8 */
+                    v128_t w = wasm_i16x8_add(al, wasm_u16x8_shr(al, 7));
+                    v128_t v = wasm_i16x8_sub(wasm_i16x8_splat(256), w);
+                    out[half] = wasm_u16x8_shr(wasm_i16x8_add(wasm_i16x8_mul(px, v),
+                                                   wasm_i16x8_mul(rgba, w)), 8);
+                }
+            }
+            wasm_v128_store(p, wasm_u8x16_narrow_i16x8(out[0], out[1]));   /* saturates */
         }
+        for (; x <= x1; x++, p += 4) {
+            int dx = x - mid;
+            int aa = (int)(scale * (left - (float)(dx * dx)));
+            if (aa < 4) continue;                       /* too faint to see */
+            if (aa > 255) aa = 255;
+            if (additive) {
+                int v0 = p[0] + cr * aa / 255, v1 = p[1] + cg * aa / 255,
+                    v2 = p[2] + cb * aa / 255;
+                p[0] = (uint8_t)(v0 > 255 ? 255 : v0);
+                p[1] = (uint8_t)(v1 > 255 ? 255 : v1);
+                p[2] = (uint8_t)(v2 > 255 ? 255 : v2);
+            } else {
+                int w = aa + (aa >> 7), v = 256 - w;
+                p[0] = (uint8_t)((p[0] * v + cr * w) >> 8);
+                p[1] = (uint8_t)((p[1] * v + cg * w) >> 8);
+                p[2] = (uint8_t)((p[2] * v + cb * w) >> 8);
+            }
+        }
+    }
 }
 
 static void draw_particles(int kind) {
@@ -242,32 +312,52 @@ static void draw_particles(int kind) {
         if (q->kind != kind) continue;
         float f = q->age / q->life;                   /* 0 new -> 1 gone */
         if (kind == P_SMOKE) {
-            int a = (int)(150.0f * (1.0f - f) * (f < 0.2f ? f * 5.0f : 1.0f));
-            blob(q->x, q->y, q->size * (1.0f + 1.6f * f), 0x585c62, a, 0);
-        } else if (kind == P_FIRE) {                  /* white-hot -> orange -> red */
-            uint32_t col = f < 0.35f ? blendc(0xc8f5ff, 0x1e8cff, (int)(f / 0.35f * 255))
-                         : blendc(0x1e8cff, 0x0a1e96, (int)((f - 0.35f) / 0.65f * 255));
-            blob(q->x, q->y, q->size * (1.0f + 0.9f * f), col, (int)(210.0f * (1.0f - f * f)), 1);
+            int a = (int)(185.0f * (1.0f - f) * (f < 0.2f ? f * 5.0f : 1.0f));
+            blob(q->x, q->y, q->size * (1.0f + 1.6f * f), 0x26282e, a, 0);
         } else if (kind == P_CHUNK) {
             int s = (int)q->size, a = f < 0.7f ? 255 : (int)(255.0f * (1.0f - f) / 0.3f);
+            for (int dy = -1; dy <= s; dy++)                  /* dark rim */
+                for (int dx = -1; dx <= s; dx++)
+                    if ((dx < 0 || dx == s) != (dy < 0 || dy == s))
+                        blendpx((int)q->x + dx - s / 2, (int)q->y + dy - s / 2, TRACKC, a);
             for (int dy = 0; dy < s; dy++)
                 for (int dx = 0; dx < s; dx++) {
-                    if (s > 3 && (dx == 0 || dx == s - 1) && (dy == 0 || dy == s - 1))
-                        continue;                     /* knock off the corners */
                     blendpx((int)q->x + dx - s / 2, (int)q->y + dy - s / 2, q->col, a);
                 }
         } else {                                      /* spark: streak along velocity */
-            uint32_t col = blendc(0xdcffff, 0x1478ff, (int)(f * 255));
+            uint32_t col = blendc(0xe6ffff, 0x00c8ff, (int)(f * 255));
             int len = 2 + (int)(sqrtf(q->vx * q->vx + q->vy * q->vy) * 0.03f);
             for (int k = 0; k < len; k++) {
                 float back = 0.03f * (float)k / (float)len;
                 int x = (int)(q->x - q->vx * back), y = (int)(q->y - q->vy * back);
                 int a = (int)(255.0f * (1.0f - f) * (1.0f - (float)k / (float)len));
-                addpx(x, y, col, a);
-                if (q->size > 1.5f) addpx(x + 1, y, col, a);
+                blendpx(x, y, col, a);
+                if (q->size > 1.5f) blendpx(x + 1, y, col, a);
             }
         }
     }
+}
+
+/* Fire in two layers, every flame's body before any flame's core, so the ball
+ * has a white-yellow heart inside orange and red edges. */
+static void draw_fire(void) {
+    for (int layer = 0; layer < 2; layer++)
+        for (int i = 0; i < MAXPART; i++) {
+            const part_t *q = &part[i];
+            if (q->kind != P_FIRE) continue;
+            float f = q->age / q->life;
+            float r = q->size * (1.0f + 0.9f * f);
+            if (!layer) {                                    /* orange -> deep red */
+                uint32_t col = f < 0.45f
+                    ? blendc(0x0a6eff, 0x0a1eaa, (int)(f / 0.45f * 255))        /* to red */
+                    : blendc(0x0a1eaa, 0x26282e, (int)((f - 0.45f) / 0.55f * 255)); /* to soot */
+                blob(q->x, q->y, r * 1.1f, col, (int)(255.0f * (1.0f - f * f)), 0);
+            } else if (f < 0.65f) {                          /* white-yellow -> orange */
+                float g = f / 0.65f;
+                blob(q->x, q->y, r * 0.72f, blendc(0xc8ffff, 0x14aaff, (int)(g * 255)),
+                     (int)(255.0f * (1.0f - g * g)), 0);
+            }
+        }
 }
 
 static void explode(int i, double t) {
@@ -277,12 +367,13 @@ static void explode(int i, double t) {
         if (!b_on[j]) { slot = j; break; }
         if (b_t0[j] < b_t0[slot]) slot = j;
     }
-    b_on[slot] = 1; b_x[slot] = bx; b_y[slot] = by; b_t0[slot] = t;
-    burst((float)(bx * CELL + CELL / 2), (float)(by * CELL + CELL / 2));
+    const potsize_t *z = &SIZE_OF[p_size[i]];
+    b_on[slot] = 1; b_x[slot] = bx; b_y[slot] = by; b_t0[slot] = t; b_size[slot] = p_size[i];
+    burst((float)(bx * CELL + CELL / 2), (float)(by * CELL + CELL / 2), z);
     for (j = 0; j < MAXPOT; j++)
-        if (j != i && p_on[j] && absv(p_x[j] - bx) <= BLAST_R && absv(p_y[j] - by) <= BLAST_R)
+        if (j != i && p_on[j] && absv(p_x[j] - bx) <= z->reach && absv(p_y[j] - by) <= z->reach)
             p_on[j] = 0;
-    if (!dead && absv(px_ - bx) <= BLAST_R && absv(py_ - by) <= BLAST_R) {
+    if (!dead && absv(px_ - bx) <= z->reach && absv(py_ - by) <= z->reach) {
         hearts--;
         if (hearts <= 0) { hearts = 0; dead = 1; }
     }
@@ -302,16 +393,18 @@ static void do_move(int d, double t) {
     if (d == 0) ny--; else if (d == 1) nx++; else if (d == 2) ny++; else nx--;
     facing = d;
     if (nx < 0 || nx >= GRID || ny < 0 || ny >= GRID) return;   /* walls block, but you turn */
-    double a = glide(t);                     /* start from wherever he is drawn now */
-    from_x += (px_ - from_x) * a;
-    from_y += (py_ - from_y) * a;
+    /* Always glide from the cell he is leaving: a quick next input snaps him
+     * there first, so the drawing never trails more than one step behind. */
+    from_x = px_;
+    from_y = py_;
     move_t0 = t;
     px_ = nx; py_ = ny;
     stride ^= 1;
     for (int i = 0; i < MAXPOT; i++)
         if (p_on[i] && p_x[i] == px_ && p_y[i] == py_) {   /* defused! */
             p_on[i] = 0;
-            score++;
+            score += SIZE_OF[p_size[i]].points;
+            defused++;
             break;
         }
 }
@@ -330,69 +423,157 @@ static void draw_sprite(const sprite_t *s, int cx, int cy, uint32_t tint, int am
         }
 }
 
-/* Countdown ring: a bright arc for the fuse time left, over a dim full track.
- * It drains clockwise from 12 o'clock; `burnt` runs 0 (new) -> 1 (boom). */
-static void timer_ring(int cx, int cy, uint32_t col, double burnt) {
-    for (int dy = -TIMER_R; dy <= TIMER_R; dy++)
-        for (int dx = -TIMER_R; dx <= TIMER_R; dx++) {
-            int d = dx * dx + dy * dy;
-            if (d > TIMER_R * TIMER_R) continue;
-            if (d < (TIMER_R - TIMER_W) * (TIMER_R - TIMER_W)) {
-                blendpx(cx + dx, cy + dy, col, 45);             /* faint inner glow */
-                continue;
+/* Countdown ring geometry, worked out once per size: every pixel of the ring,
+ * whether it is rim, and how far clockwise from 12 o'clock it sits (0..1). */
+#define RING_MAX_R 33                                     /* the BIG ring */
+#define RING_BOX (2 * (RING_MAX_R + 1) + 1)
+static struct { int8_t dx, dy; uint8_t rim; double turn; } ring[SIZES][RING_BOX * RING_BOX];
+static int ring_len[SIZES];
+
+static void build_rings(void) {
+    for (int z = 0; z < SIZES; z++) {
+        int r = SIZE_OF[z].ring, outer = r + 1, inner = r - TIMER_W - 1, n = 0;
+        for (int dy = -outer; dy <= outer; dy++)
+            for (int dx = -outer; dx <= outer; dx++) {
+                int d = dx * dx + dy * dy;
+                if (d > outer * outer || d < inner * inner) continue;
+                double turn = atan2((double)dx, (double)-dy) / 6.283185307179586;
+                ring[z][n].dx = (int8_t)dx;
+                ring[z][n].dy = (int8_t)dy;
+                ring[z][n].rim = d > r * r || d < (r - TIMER_W) * (r - TIMER_W);
+                ring[z][n].turn = turn < 0 ? turn + 1.0 : turn;
+                n++;
             }
-            double turn = atan2((double)dx, (double)-dy) / 6.283185307179586;
-            if (turn < 0) turn += 1.0;
-            if (turn >= burnt) blendpx(cx + dx, cy + dy, col, 255);
-            else               blendpx(cx + dx, cy + dy, TRACKC, 70);
+        ring_len[z] = n;
+    }
+}
+
+/* A bright arc for the fuse time left, the rest dark, with a dark rim so it reads
+ * on the light field. It drains clockwise; `burnt` runs 0 (new) -> 1 (boom). */
+static void timer_ring(int cx, int cy, int z, uint32_t col, double burnt) {
+    for (int i = 0; i < ring_len[z]; i++) {
+        int x = cx + ring[z][i].dx, y = cy + ring[z][i].dy;
+        if (ring[z][i].rim)                 blendpx(x, y, TRACKC, 200);
+        else if (ring[z][i].turn >= burnt)  blendpx(x, y, col, 255);
+        else                                blendpx(x, y, TRACKC, 220);
+    }
+}
+
+/* ------------------------------------------------------------------- field */
+
+static uint32_t field[W * H];                /* the ground never changes: built once */
+static int field_ready = 0;
+
+static void stamp_tile(int gx, int gy, int tile) {
+    const sprite_t *s = &TILE_SPR[tile];
+    for (int y = 0; y < s->h; y++)
+        for (int x = 0; x < s->w; x++) {
+            const uint8_t *p = &s->px[(y * s->w + x) * 4];
+            if (p[3] < 128) continue;                     /* pixel art: on or off */
+            field[(gy * CELL + y) * W + gx * CELL + x] =
+                0xff000000u | p[0] | (p[1] << 8) | ((uint32_t)p[2] << 16);
         }
+}
+
+/* a fully ploughed field: soil rows on every line inside a grass border, with
+ * some scenery round the edge */
+static void build_field(void) {
+    static const struct { int x, y, tile; } scenery[] = {
+        { 0, 0, 3 }, { 20, 0, 4 }, { 0, 20, 5 }, { 20, 20, 3 }, { 0, 7, 6 },
+        { 20, 12, 9 }, { 8, 0, 7 }, { 13, 20, 7 }, { 0, 14, 8 }, { 20, 5, 5 },
+    };
+    const uint8_t *g = TILE_SPR[0].px;       /* corner of a row tile is plain grass */
+    uint32_t grass = 0xff000000u | g[0] | (g[1] << 8) | ((uint32_t)g[2] << 16);
+    for (int i = 0; i < W * H; i++) field[i] = grass;
+    for (int gy = 1; gy < GRID - 1; gy++)
+        for (int gx = 1; gx < GRID - 1; gx++)
+            stamp_tile(gx, gy, gx == 1 ? 0 : gx == GRID - 2 ? 2 : 1);
+    for (unsigned i = 0; i < sizeof scenery / sizeof scenery[0]; i++)
+        stamp_tile(scenery[i].x, scenery[i].y, scenery[i].tile);
+    build_rings();
+    field_ready = 1;
+}
+
+/* tint every pixel toward FLASHC: one flat loop, so it vectorises */
+static void flash_screen(int a) {
+    if (a <= 0) return;
+    uint16_t w = (uint16_t)(a + (a >> 7)), keep[4], add[4];
+    for (int k = 0; k < 4; k++) {
+        keep[k] = k < 3 ? (uint16_t)(256 - w) : 256;          /* alpha unchanged */
+        add[k] = k < 3 ? (uint16_t)(((FLASHC >> (8 * k)) & 0xff) * w) : 0;
+    }
+    for (int i = 0; i < W * H * 4; i += 4)
+        for (int k = 0; k < 4; k++)
+            pixels[i + k] = (uint8_t)((uint16_t)(pixels[i + k] * keep[k] + add[k]) >> 8);
 }
 
 static void render(double t) {
     int x, y, i;
-    double shake = 0.0, flash = 0.0;
+    double shake = 0.0, flash = 0.0;        /* shake in px, flash in alpha */
 
     for (i = 0; i < MAXBLAST; i++) {
         if (!b_on[i]) continue;
+        const potsize_t *z = &SIZE_OF[b_size[i]];
         double age = t - b_t0[i];
-        if (age < 0 || age > BLAST_MS) { b_on[i] = 0; continue; }
+        if (age < 0 || age > z->blast_ms) { b_on[i] = 0; continue; }
         if (reduced_motion) continue;
-        double s = 1.0 - age / SHAKE_MS, f = 1.0 - age / FLASH_MS;
-        if (s > 0 && s * s > shake) shake = s * s;
-        if (f > 0 && f * f > flash) flash = f * f;
+        double s = 1.0 - age / z->shake_ms, f = 1.0 - age / z->flash_ms;
+        if (s > 0 && z->shake_px * s * s > shake) shake = z->shake_px * s * s;
+        if (f > 0 && z->flash_a * f * f > flash) flash = z->flash_a * f * f;
     }
-    ox = (int)lround(SHAKE_PX * shake * sin(t * 0.093));
-    oy = (int)lround(SHAKE_PX * shake * sin(t * 0.121 + 1.7));
+    ox = (int)lround(shake * sin(t * 0.093));
+    oy = (int)lround(shake * sin(t * 0.121 + 1.7));
 
-    for (y = 0; y < H; y++)
-        for (x = 0; x < W; x++) {
-            uint32_t c = bg_at(x - ox, y - oy);
-            uint8_t *p = &pixels[(y * W + x) * 4];
-            p[0] = c & 0xff; p[1] = (c >> 8) & 0xff; p[2] = (c >> 16) & 0xff; p[3] = 255;
+    if (!field_ready) build_field();
+    if (!ox && !oy) {
+        memcpy(pixels, field, sizeof pixels);         /* RGBA, little-endian */
+    } else {
+        for (y = 0; y < H; y++) {             /* shake looks past the edges */
+            int fy = y - oy;
+            fy = fy < 0 ? 0 : fy >= H ? H - 1 : fy;
+            const uint32_t *src = &field[fy * W];
+            uint32_t *dst = (uint32_t *)(void *)&pixels[y * W * 4];
+            int lead = ox > 0 ? ox : 0, tail = ox < 0 ? -ox : 0;
+            for (x = 0; x < lead; x++) dst[x] = src[0];
+            memcpy(dst + lead, src + lead - ox, (size_t)(W - lead - tail) * 4);
+            for (x = W - tail; x < W; x++) dst[x] = src[W - 1];
         }
+    }
 
     draw_particles(P_SMOKE);
-    draw_particles(P_FIRE);
+    draw_fire();
 
     /* shockwave rings */
     for (i = 0; i < MAXBLAST; i++) {
         if (!b_on[i]) continue;
-        double e = (t - b_t0[i]) / BLAST_MS, left = 1.0 - e;
+        const potsize_t *z = &SIZE_OF[b_size[i]];
+        double e = (t - b_t0[i]) / z->blast_ms, left = 1.0 - e;
         int cx = b_x[i] * CELL + CELL / 2, cy = b_y[i] * CELL + CELL / 2;
-        double r = 8.0 + (BLAST_R + 1.0) * CELL * (1.0 - left * left * left);
-        double w = 2.0 + 9.0 * left;
+        double r = 8.0 + (z->reach + 1.0) * CELL * (1.0 - left * left * left);
+        double w = 2.0 + 9.0 * z->grain * left;
         int h = (int)(r + w) + 1;
         double rin = (r - w) > 0 ? (r - w) * (r - w) : 0.0, rout = r * r;
-        for (int dy = -h; dy <= h; dy++)
-            for (int dx = -h; dx <= h; dx++) {
-                double d = dx * dx + dy * dy;
-                if (d >= rin && d <= rout) addpx(cx + dx, cy + dy, WAVEC, (int)(230.0 * left));
+        double lim = (r + 3) * (r + 3);
+        for (int dy = -h; dy <= h; dy++) {
+            double dy2 = dy * dy;
+            if (dy2 > lim) continue;
+            int far = (int)sqrt(lim - dy2) + 1;
+            int hole = dy2 < rin ? (int)sqrt(rin - dy2) - 1 : 0;   /* empty middle */
+            if (far > h) far = h;
+            for (int dx = -far; dx <= far; dx++) {
+                if (hole > 0 && dx == 1 - hole) dx = hole;
+                double d = dx * dx + dy2;
+                if (d >= rin && d <= rout) blendpx(cx + dx, cy + dy, WAVEC, (int)(245.0 * left));
+                else if (d > rout && d <= (r + 3) * (r + 3))
+                    blendpx(cx + dx, cy + dy, TRACKC, (int)(150.0 * left));   /* dark edge */
             }
+        }
     }
 
     /* fused potatoes */
+    for (int size = BIG; size >= SMALL; size--)
     for (i = 0; i < MAXPOT; i++) {
-        if (!p_on[i]) continue;
+        if (!p_on[i] || p_size[i] != size) continue;
         int cx = p_x[i] * CELL + CELL / 2, cy = p_y[i] * CELL + CELL / 2;
         double total = p_dead[i] - p_t0[i];
         double p = t - p_t0[i];
@@ -402,12 +583,12 @@ static void render(double t) {
         uint32_t col = f < 0.34 ? PUTC1 : (f < 0.67 ? PUTC2 : PUTC3);
         double pulse = 0.5 + 0.5 * sin((t + i * 97.0) * 0.015);
         int frame_no = (int)(pulse * 3.99) + (f > 0.66 ? BOMB_FRAMES - 4 : 0);
-        const sprite_t *s = &BOMB_SPR[frame_no];
+        const sprite_t *s = &BOMB_SPR[size][frame_no];
         uint32_t tint = PUTC3;
         int amt = f > 0.66 ? (int)(140.0 * (f - 0.66) / 0.34) : 0;
         if (f > 0.85 && ((int)(t / 90.0) & 1)) { tint = 0xffffff; amt = 150; }  /* blink */
         draw_sprite(s, cx, cy, tint, amt);
-        timer_ring(cx, cy, col, f);
+        timer_ring(cx, cy, size, col, f);
         /* fuse spark on the sprout, jittering */
         int jx = cx + s->w / 5 + ((int)(t * 0.53 + i) % 3) - 1, jy = cy - s->h / 2 + 1;
         blob((float)jx, (float)jy, 4.5f, SPARKC, 230, 1);
@@ -427,19 +608,13 @@ static void render(double t) {
         if (sx > W - s->w / 2) sx = W - s->w / 2;
         if (sy < s->h / 2) sy = s->h / 2;
         if (sy > H - s->h / 2) sy = H - s->h / 2;
-        blob((float)cx, (float)cy, 38.0f, GLOWC, 80, 0);
         draw_sprite(s, sx, sy, 0x101010, dead ? 160 : 0);     /* charred */
     }
 
     draw_particles(P_CHUNK);
     draw_particles(P_SPARK);
 
-    if (flash > 0.0) {
-        int a = (int)(120.0 * flash);
-        for (y = 0; y < H; y++)
-            for (x = 0; x < W; x++)
-                blendpx(x - ox, y - oy, FLASHC, a);
-    }
+    if (flash > 0.0) flash_screen((int)flash);
 }
 
 /* ------------------------------------------------------------------ state */
@@ -447,16 +622,16 @@ static void render(double t) {
 EMSCRIPTEN_KEEPALIVE
 void init_game(void) {
     px_ = GRID / 2; py_ = GRID / 2;
-    dead = 0; hearts = MAXHEARTS; score = 0;
-    facing = 2; stride = 0; held = -1; next_hold = 0.0;
+    dead = 0; time_up = 0; hearts = MAXHEARTS; score = 0; defused = 0;
+    facing = 2; stride = 0; held = -1; next_hold = 0.0; walking = 0;
     from_x = px_; from_y = py_; move_t0 = -1e9;
     memset(p_on, 0, sizeof p_on);
     memset(b_on, 0, sizeof b_on);
     memset(part, 0, sizeof part);
     part_next = 0;
-    started = 0; start_ms = 0.0; last_now = 0.0; last_step_ms = -1e9;
+    started = 0; start_ms = 0.0; last_now = 0.0;
     next_spawn = 700.0;
-    render(0);
+    invalidate(0);
 }
 
 EMSCRIPTEN_KEEPALIVE
@@ -465,7 +640,7 @@ void frame(double now) {
     if (!isfinite(now)) return;
     if (!started) {                           /* first call primes the game clock */
         started = 1; start_ms = now; last_now = now; next_spawn = 700.0;
-        render(0);
+        invalidate(0);
         return;
     }
     if (now < last_now) now = last_now;
@@ -473,10 +648,12 @@ void frame(double now) {
     last_now = now;
     {
         double t = now - start_ms;
-        if (!dead) {
+        if (!dead && !time_up) {
+            /* fuses that ran out before the buzzer still count */
+            double limit = t < ROUND_MS ? t : ROUND_MS;
             /* bounded catch-up: after a long stall the board can only fill once */
-            for (int n = 0; n < MAXPOT && t >= next_spawn; n++) {
-                if (potcount() < maxpot()) {
+            for (int n = 0; n < MAXPOT && t < ROUND_MS && t >= next_spawn; n++) {
+                if (potcount() < potato_cap(t)) {
                     int tries = 0, j, cx, cy;
                     while (tries++ < 40) {
                         cx = (int)(rng() % GRID);
@@ -491,39 +668,44 @@ void frame(double now) {
                                 while (s < MAXPOT && p_on[s]) s++;
                                 if (s < MAXPOT) {
                                     p_on[s] = 1; p_x[s] = cx; p_y[s] = cy;
-                                    p_t0[s] = t; p_dead[s] = t + fuse_for();
+                                    int roll = (int)(rng() % 100);   /* 50 / 35 / 15 % */
+                                    p_size[s] = roll < 50 ? SMALL : roll < 85 ? MEDIUM : BIG;
+                                    p_t0[s] = t; p_dead[s] = t + fuse_length(t);
                                     break;
                                 }
                             }
                         }
                     }
                 }
-                next_spawn += spawnevery();
+                next_spawn += spawn_gap(t);
             }
-            if (t >= next_spawn) next_spawn = t + spawnevery();
+            if (t >= next_spawn) next_spawn = t + spawn_gap(t);
             for (i = 0; i < MAXPOT; i++)
-                if (p_on[i] && t >= p_dead[i]) explode(i, t);
+                if (p_on[i] && limit >= p_dead[i]) explode(i, t);
+            if (t >= ROUND_MS && !dead) {         /* buzzer: the field goes quiet */
+                time_up = 1;
+                held = -1; walking = 0;
+                memset(p_on, 0, sizeof p_on);
+            }
         }
-        if (!dead && held >= 0 && t >= next_hold) {       /* after blasts: expired fuses first */
+        if (!dead && !time_up && held >= 0 && t >= next_hold) {       /* after blasts: expired fuses first */
             /* keep the schedule so the walk is seamless, but never burst after a stall */
             double at = t - next_hold > MOVE_MS ? t : next_hold;
             do_move(held, at);
-            last_step_ms = last_now;
+            walking = 1;
             next_hold = at + MOVE_MS;
         }
-        render(t);
+        invalidate(t);
     }
 }
 
 EMSCRIPTEN_KEEPALIVE
 int step(int d) {
-    if (dead || d < 0 || d > 3) return score;
-    if (last_now - last_step_ms < STEP_MIN_MS) return score;
-    last_step_ms = last_now;
+    if (dead || time_up || d < 0 || d > 3) return score;
     double t = started ? last_now - start_ms : 0.0;
     do_move(d, t);
-    /* A step changed state; render it now so the buffer is never a stale frame. */
-    render(t);
+    if (held >= 0 && next_hold < t + MOVE_MS) next_hold = t + MOVE_MS;
+    invalidate(t);
     return score;
 }
 
@@ -531,24 +713,55 @@ int step(int d) {
  * walking that way; the first step is the caller's step(). */
 EMSCRIPTEN_KEEPALIVE
 void hold(int d) {
-    held = (d >= 0 && d <= 3) ? d : -1;
-    next_hold = (started ? last_now - start_ms : 0.0) + HOLD_DELAY_MS;
+    if (d < 0 || d > 3) { held = -1; walking = 0; return; }
+    if (d == held) return;
+    held = d;
+    double t = started ? last_now - start_ms : 0.0;
+    if (!walking) {
+        next_hold = t + HOLD_DELAY_MS;
+    } else if (!dead && !time_up) {
+        /* changing direction mid-walk: turn now and keep the pace, no new delay */
+        double ready = move_t0 + MOVE_MS;
+        next_hold = ready > t ? ready : t;
+        facing = d;
+        invalidate(t);
+    }
+}
+
+/* A movement key went down at time `now`. */
+EMSCRIPTEN_KEEPALIVE
+void press(double now, int d) {
+    int was = held;
+    held = -1;                  /* the previous key must not get one last step in */
+    frame(now);                 /* bring the clock up to date: expired fuses blow first */
+    held = was;                 /* lets hold() see that we were already walking */
+    step(d);
+    hold(d);
 }
 
 EMSCRIPTEN_KEEPALIVE
-void set_potato(int x, int y, double fuse_ms) {          /* test/debug hook */
-    if (x < 0 || x >= GRID || y < 0 || y >= GRID) return;
+void set_sized_potato(int x, int y, double fuse_ms, int size) {   /* test/debug hook */
+    if (x < 0 || x >= GRID || y < 0 || y >= GRID || size < SMALL || size > BIG) return;
     if (!isfinite(fuse_ms) || fuse_ms < 1.0) fuse_ms = 1.0;
     int s = 0;
     while (s < MAXPOT && p_on[s]) s++;
     if (s >= MAXPOT) s = 0;
     double t = started ? last_now - start_ms : 0.0;
-    p_on[s] = 1; p_x[s] = x; p_y[s] = y;
+    p_on[s] = 1; p_x[s] = x; p_y[s] = y; p_size[s] = (uint8_t)size;
     p_t0[s] = t; p_dead[s] = t + fuse_ms;
 }
 
 EMSCRIPTEN_KEEPALIVE
-void set_reduced_motion(int on) { reduced_motion = on != 0; }
+void set_potato(int x, int y, double fuse_ms) {          /* a medium one */
+    set_sized_potato(x, y, fuse_ms, MEDIUM);
+}
+
+EMSCRIPTEN_KEEPALIVE
+int potato_size(int i) { return i >= 0 && i < MAXPOT && p_on[i] ? p_size[i] : -1; }
+EMSCRIPTEN_KEEPALIVE
+int get_defused(void) { return defused; }
+EMSCRIPTEN_KEEPALIVE
+void set_reduced_motion(int on) { reduced_motion = on != 0; dirty = 1; }
 EMSCRIPTEN_KEEPALIVE
 int get_particles(void) {
     int i, n = 0;
@@ -556,7 +769,10 @@ int get_particles(void) {
     return n;
 }
 EMSCRIPTEN_KEEPALIVE
-const uint8_t *game_buf(void) { return pixels; }
+const uint8_t *game_buf(void) {              /* up-to-date picture, RGBA */
+    if (dirty) { render(draw_t); dirty = 0; }
+    return pixels;
+}
 EMSCRIPTEN_KEEPALIVE
 int game_w(void) { return W; }
 EMSCRIPTEN_KEEPALIVE
@@ -567,3 +783,12 @@ EMSCRIPTEN_KEEPALIVE
 int get_hearts(void) { return hearts; }
 EMSCRIPTEN_KEEPALIVE
 int get_dead(void) { return dead; }
+EMSCRIPTEN_KEEPALIVE
+int get_over(void) { return dead || time_up; }
+EMSCRIPTEN_KEEPALIVE
+int get_potatoes(void) { return potcount(); }
+EMSCRIPTEN_KEEPALIVE
+int get_time_left(void) {                    /* ms left in the round */
+    double left = started ? ROUND_MS - (last_now - start_ms) : ROUND_MS;
+    return left < 0 ? 0 : (int)ceil(left);
+}

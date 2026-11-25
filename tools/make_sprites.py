@@ -6,7 +6,14 @@ from PIL import Image
 ROOT = Path(__file__).resolve().parent.parent
 FARMER_FRAME = (16, 18)              # sheet: 3 columns (stand, step, step) x 4 rows
 FARMER_SCALE = 3
-BOMB_WS = [36, 38, 40, 42, 44, 46]   # pulse animation frames, small -> large
+# tiles used from the 12-column, 16 px sheet; the order is what potato.c indexes
+FIELD_TILES = [48, 49, 50,                      # soil row: left end, middle, right end
+               15, 27, 39, 78, 83, 3, 77]       # tree, tree, bush, berries, sunflower, sapling, rocks
+BOMB_WS = [                          # per size (small, medium, big): pulse frames
+    [24, 26, 28, 30, 32, 34],
+    [36, 38, 40, 42, 44, 46],
+    [50, 52, 54, 56, 58, 60],
+]
 
 
 def bake(name, im):
@@ -48,14 +55,30 @@ def main():
             code, entry = bake(f"farmer{row}{col}", frame)
             out.append(code)
             farmer.append(entry)
-    bombs = []
-    for i, w in enumerate(BOMB_WS):
-        code, entry = bake(f"bomb{i}", photo(ROOT / "assets/potato_bomb.png", w))
+    tiles = Image.open(ROOT / "assets/field_tiles.png").convert("RGBA")
+    if tiles.size != (12 * 16, 11 * 16):
+        raise SystemExit(f"field_tiles.png must be 192x176, got {tiles.size}")
+    field = []
+    for n in FIELD_TILES:
+        x, y = n % 12 * 16, n // 12 * 16
+        tile = tiles.crop((x, y, x + 16, y + 16)).resize((32, 32), Image.NEAREST)
+        code, entry = bake(f"tile{n}", tile)
         out.append(code)
-        bombs.append(entry)
+        field.append(entry)
+    sizes = []
+    for size, widths in enumerate(BOMB_WS):
+        row = []
+        for i, w in enumerate(widths):
+            code, entry = bake(f"bomb{size}_{i}", photo(ROOT / "assets/potato_bomb.png", w))
+            out.append(code)
+            row.append(entry)
+        sizes.append("{ " + ",\n      ".join(row) + " }")
     out.append(array("FARMER_SPR", farmer) + "   /* [row * 3 + col] */")
-    out.append(f"#define BOMB_FRAMES {len(bombs)}")
-    out.append(array("BOMB_SPR", bombs))
+    out.append(array("TILE_SPR", field))
+    out.append(f"#define BOMB_SIZES {len(BOMB_WS)}")
+    out.append(f"#define BOMB_FRAMES {len(BOMB_WS[0])}")
+    out.append("static const sprite_t BOMB_SPR[BOMB_SIZES][BOMB_FRAMES] = {\n    "
+               + ",\n    ".join(sizes) + "\n};")
     (ROOT / "src/sprites.h").write_text("\n".join(out) + "\n")
 
 
