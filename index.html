@@ -235,11 +235,15 @@ function report(tag, e) {
 
     /* ------------------------------------------------------------ input */
     const MOVES = { arrowup: 0, w: 0, arrowright: 1, d: 1, arrowdown: 2, s: 2, arrowleft: 3, a: 3 };
-    // Movement keys currently down, newest last. The engine paces held walking,
-    // so the operating system's key repeat is ignored.
+    // Movement keys currently down, newest last: the newest wins. The engine does
+    // the walking, so the operating system's key repeat is ignored.
     let down = [];
-    const holdNewest = () => P._hold(down.length ? MOVES[down[down.length - 1]] : -1);
-    function releaseAll() { down = []; P._hold(-1); }
+    // outside a round the clock must not be touched: _move() advances it
+    function steer() {
+      if (state !== 'playing') return;
+      P._move(performance.now(), down.length ? MOVES[down[down.length - 1]] : -1);
+    }
+    function releaseAll() { down = []; steer(); }
 
     addEventListener('keydown', e => {
       if (e.ctrlKey || e.metaKey || e.altKey) return;   // leave browser shortcuts alone
@@ -258,7 +262,7 @@ function report(tag, e) {
         if (state === 'over') return;
         if (state === 'ready') { state = 'playing'; overlay.hidden = true; }
         down = down.filter(other => other !== k).concat(k);
-        P._press(performance.now(), MOVES[k]);
+        steer();
       }
       draw();                    // every keystroke gets immediate visible feedback
     });
@@ -266,7 +270,7 @@ function report(tag, e) {
       const k = e.key.toLowerCase();
       if (!down.includes(k)) return;
       down = down.filter(other => other !== k);
-      holdNewest();              // first, so no step can slip in after the release
+      steer();
       draw();
     });
     // a keyup can be lost when focus leaves: never leave the farmer walking

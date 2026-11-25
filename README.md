@@ -28,7 +28,9 @@ python3 -m http.server 8080
 
 Needs a browser with WebAssembly SIMD (Chrome 91+, Firefox 89+, Safari 16.4+).
 
-- **Arrows / WASD** — tap to move one cell, hold to keep walking
+- **Arrows / WASD** — hold to walk; the newest key wins
+
+Explosions knock you away, even on a near miss.
 - **R** — restart
 
 The clock starts on your first move. The top ten is saved in that browser only.
@@ -84,8 +86,8 @@ node test_node.js
 - The engine owns the canvas: it renders straight into a WebAssembly memory
   buffer (RGBA) that JS blits with `putImageData`. Drawing is lazy: state changes
   mark the picture stale and `_game_buf()` draws it.
-- Movement rules are per cell; the glide is drawing only and never trails more
-  than one step behind the input.
+- The farmer moves freely and stops as soon as the key is released. Potatoes sit
+  on a grid: walking close defuses one, and blasts are judged cell by cell.
 - Time is wall-clock (`performance.now()`), so the game advances in real time
   even in a throttled background tab; input events force an immediate
   render+HUD refresh so a stale frame can never be left on screen.

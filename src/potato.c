@@ -12,9 +12,11 @@
  * plus a shockwave, screen flash and screen shake.
  *
  * Game logic + rendering in C. Rendering writes an RGBA byte buffer; a
- * thin JS layer (index.html) pushes it to a <canvas> each frame. Player
- * movement is event-driven (_step), fuses/spawns/explosions run on the
- * wall clock passed to _frame.
+ * thin JS layer (index.html) pushes it to a <canvas> each frame. Movement,
+ * fuses, spawns and explosions all run on the wall clock passed to _frame.
+ *
+ * The farmer walks freely while a direction is held (_move) and stops the
+ * moment it is released. Nearby explosions knock him away from the blast.
  *
  * A round lasts one minute from the first frame: score as much as you can.
  * Potatoes arrive faster, in greater numbers and with shorter fuses as the
@@ -22,7 +24,7 @@
  *
  * Exports: init_game() step(int d) set_potato(int x, int y, double fuse_ms)
  *          frame(double now_ms) get_score() get_hearts() get_dead()
- *          press(double now_ms, int d) hold(int d)
+ *          move(double now_ms, int d) get_farmer_x() get_farmer_y()
  *          get_particles() set_reduced_motion(int on)
  *          get_time_left() get_over() get_potatoes()
  *          potato_cap(double ms) spawn_gap(double ms) fuse_length(double ms)
@@ -53,8 +55,19 @@
 #define FUSE_END   3800.0
 #define MAXPART  3072
 #define MAXHEARTS 3
-#define MOVE_MS    100.0     /* glide time for one cell; also the held-key pace */
-#define HOLD_DELAY_MS 150.0  /* a held key starts repeating after this */
+#define WALK_SPEED 320.0     /* px per second */
+#define WALK_CAP_MS 100.0    /* one frame never walks further than this, even after a stall */
+#define WALK_SUB    8.0      /* collision checks at least this often along the way, px */
+#define STRIDE_PX  20.0      /* distance walked per animation frame */
+#define KB_DECAY   12.0      /* knockback dies away at this rate, per second */
+#define KB_MAX    180.0      /* furthest a pile of blasts can throw him, px */
+#define FEET_UP     6        /* he is drawn this far above his position */
+/* limits for his position that keep the whole sprite on screen */
+#define MIN_X 24.0
+#define MAX_X (W - 24.0)
+#define MIN_Y 33.0
+#define MAX_Y (H - 21.0)
+#define SPAWN_CLEAR 44.0     /* potatoes never appear closer to him than this, px */
 #define TIMER_W    4          /* countdown ring width, px */
 
 /* colors (24-bit) */
@@ -76,27 +89,27 @@ typedef struct {
     double blast_ms, flash_ms, shake_ms;
     double shake_px;
     int flash_a;
+    double touch;                          /* walking this close defuses it, px */
+    double push;                           /* knockback distance next to the blast, px */
 } potsize_t;
 static const potsize_t SIZE_OF[SIZES] = {
-    /*  pts reach ring  smoke fire chunk spark  speed grain  blast flash shake  px  alpha */
-    { 1, 1, 20,   18,  34, 12,  40,   0.62f, 0.75f,  340, 100, 260,  5.0,  70 },
-    { 3, 2, 26,   40,  80, 30,  90,   1.00f, 1.00f,  450, 130, 380, 11.0, 120 },
-    { 5, 3, 33,   65, 140, 55, 170,   1.38f, 1.35f,  650, 180, 560, 21.0, 150 },
+    /*  pts reach ring  smoke fire chunk spark  speed grain  blast flash shake  px  alpha touch push */
+    { 1, 1, 20,   18,  34, 12,  40,   0.62f, 0.75f,  340, 100, 260,  5.0,  70,  18,  48 },
+    { 3, 2, 26,   40,  80, 30,  90,   1.00f, 1.00f,  450, 130, 380, 11.0, 120,  22,  90 },
+    { 5, 3, 33,   65, 140, 55, 170,   1.38f, 1.35f,  650, 180, 560, 21.0, 150,  28, 144 },
 };
 
 static _Alignas(16) uint8_t pixels[W * H * 4];
 
-static int px_ = GRID / 2, py_ = GRID / 2;   /* player cell */
+static double fx = W / 2, fy = H / 2;        /* the farmer's position, px */
+static double kx = 0.0, ky = 0.0;            /* knockback velocity, px per second */
 static int dead = 0;                         /* out of hearts */
 static int time_up = 0;                      /* the minute ran out */
 static int facing = 2;                       /* 0 up, 1 right, 2 down, 3 left */
-static int stride = 0;                       /* alternates the two walk frames */
-static double from_x = 0.0, from_y = 0.0;    /* glide start, in cells */
-static double move_t0 = -1e9;                /* glide start time, game ms */
 static int held = -1;                        /* direction being held, -1 none */
-static double next_hold = 0.0;               /* game ms of the next held step */
+static double walked = 0.0;                  /* px since he set off, drives the walk cycle */
+static int moving = 0;                       /* did his feet move last frame? */
 static int defused = 0;                      /* potatoes defused this round */
-static int walking = 0;                      /* has the held key started repeating? */
 static int hearts = MAXHEARTS;
 static int score = 0;
 
@@ -160,6 +173,10 @@ static void blendpx(int x, int y, uint32_t c, int a) {      /* a: 0..255 */
     p[1] = (uint8_t)((p[1] * v + (int)((c >> 8) & 0xff) * w) >> 8);
     p[2] = (uint8_t)((p[2] * v + (int)((c >> 16) & 0xff) * w) >> 8);
 }
+static double dist_to_cell(int x, int y);
+static void walk(double dist);
+static void drift(double sec);
+
 static int potcount(void) {
     int i, n = 0;
     for (i = 0; i < MAXPOT; i++) n += p_on[i];
@@ -360,6 +377,10 @@ static void draw_fire(void) {
         }
 }
 
+static int farmer_col(void);
+static int farmer_row(void);
+static void knock_back(double bx, double by, const potsize_t *z);
+
 static void explode(int i, double t) {
     int j, slot = 0, bx = p_x[i], by = p_y[i];
     p_on[i] = 0;
@@ -373,40 +394,81 @@ static void explode(int i, double t) {
     for (j = 0; j < MAXPOT; j++)
         if (j != i && p_on[j] && absv(p_x[j] - bx) <= z->reach && absv(p_y[j] - by) <= z->reach)
             p_on[j] = 0;
-    if (!dead && absv(px_ - bx) <= z->reach && absv(py_ - by) <= z->reach) {
+    if (!dead && absv(farmer_col() - bx) <= z->reach && absv(farmer_row() - by) <= z->reach) {
         hearts--;
         if (hearts <= 0) { hearts = 0; dead = 1; }
     }
+    knock_back(bx * CELL + CELL / 2, by * CELL + CELL / 2, z);
 }
 
 /* ---------------------------------------------------------------- movement */
 
-/* how far the current glide has got: 0 just started .. 1 arrived */
-static double glide(double t) {
-    double a = (t - move_t0) / MOVE_MS;
-    return a < 0 ? 0 : a > 1 ? 1 : a;
+static double limit_to(double v, double lo, double hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+/* distance from the farmer to a cell, measured to the nearest spot he can stand
+ * on, so potatoes in the edge rows are as easy to reach as any other */
+static double dist_to_cell(int x, int y) {
+    double tx = limit_to(x * CELL + CELL / 2, MIN_X, MAX_X);
+    double ty = limit_to(y * CELL + CELL / 2, MIN_Y, MAX_Y);
+    return hypot(fx - tx, fy - ty);
 }
 
-/* The rules move a whole cell at once; only the drawing glides after it. */
-static void do_move(int d, double t) {
-    int nx = px_, ny = py_;
-    if (d == 0) ny--; else if (d == 1) nx++; else if (d == 2) ny++; else nx--;
-    facing = d;
-    if (nx < 0 || nx >= GRID || ny < 0 || ny >= GRID) return;   /* walls block, but you turn */
-    /* Always glide from the cell he is leaving: a quick next input snaps him
-     * there first, so the drawing never trails more than one step behind. */
-    from_x = px_;
-    from_y = py_;
-    move_t0 = t;
-    px_ = nx; py_ = ny;
-    stride ^= 1;
+/* the grid cell he is standing in: blasts are judged cell by cell */
+static int farmer_col(void) { return (int)(fx / CELL); }
+static int farmer_row(void) { return (int)(fy / CELL); }
+
+static void defuse_touching(void) {
     for (int i = 0; i < MAXPOT; i++)
-        if (p_on[i] && p_x[i] == px_ && p_y[i] == py_) {   /* defused! */
+        if (p_on[i] && dist_to_cell(p_x[i], p_y[i]) <= SIZE_OF[p_size[i]].touch) {
             p_on[i] = 0;
             score += SIZE_OF[p_size[i]].points;
             defused++;
-            break;
         }
+}
+
+/* walk `dist` px the way he faces, defusing whatever he reaches */
+static void walk(double dist) {
+    while (dist > 1e-9) {
+        double s = dist > WALK_SUB ? WALK_SUB : dist, was_x = fx, was_y = fy;
+        dist -= s;
+        if (facing == 0) fy -= s; else if (facing == 1) fx += s;
+        else if (facing == 2) fy += s; else fx -= s;
+        fx = limit_to(fx, MIN_X, MAX_X);
+        fy = limit_to(fy, MIN_Y, MAX_Y);
+        double gone = fabs(fx - was_x) + fabs(fy - was_y);
+        if (gone > 0) { walked += gone; moving = 1; }
+        defuse_touching();
+    }
+}
+
+/* knockback over `sec` seconds: exact for any frame rate. Being thrown over a
+ * potato does not defuse it; only walking does. */
+static void drift(double sec) {
+    if (kx == 0.0 && ky == 0.0) return;
+    double left = exp(-KB_DECAY * sec), travel = (1.0 - left) / KB_DECAY;
+    fx = limit_to(fx + kx * travel, MIN_X, MAX_X);
+    fy = limit_to(fy + ky * travel, MIN_Y, MAX_Y);
+    kx *= left; ky *= left;
+    if (hypot(kx, ky) < 4.0) kx = ky = 0.0;
+}
+
+/* throw him away from a blast at (bx, by) px; harder the closer he is. It
+ * reaches two cells beyond the damage area, so near misses are felt too. */
+static void knock_back(double bx, double by, const potsize_t *z) {
+    double dx = fx - bx, dy = fy - by, d = hypot(dx, dy);
+    double range = (z->reach + 2.0) * CELL;
+    if (d >= range) return;
+    if (d < 1.0) {                           /* dead centre: thrown backwards */
+        dx = facing == 1 ? -1 : facing == 3 ? 1 : 0;
+        dy = facing == 2 ? -1 : facing == 0 ? 1 : 0;
+    } else {
+        dx /= d; dy /= d;
+    }
+    double near = 1.0 - hypot(fx - bx, fy - by) / range;
+    double speed = z->push * (0.25 + 0.75 * near) * KB_DECAY;
+    kx += dx * speed; ky += dy * speed;
+    double total = hypot(kx, ky), most = KB_MAX * KB_DECAY;
+    if (total > most) { kx *= most / total; ky *= most / total; }
 }
 
 /* ------------------------------------------------------------------ render */
@@ -597,18 +659,12 @@ static void render(double t) {
     /* you */
     {
         static const int sheet_row[4] = { 1, 3, 0, 2 };   /* up, right, down, left */
-        double a = glide(t);
-        int cx = (int)lround((from_x + (px_ - from_x) * a) * CELL) + CELL / 2;
-        int cy = (int)lround((from_y + (py_ - from_y) * a) * CELL) + CELL / 2;
-        int col = (!dead && a < 0.7) ? 1 + stride : 0;        /* stride, then plant */
+        static const int cycle[4] = { 1, 0, 2, 0 };          /* step, plant, step, plant */
+        int col = (moving && !dead && !time_up) ? cycle[(int)(walked / STRIDE_PX) % 4] : 0;
         const sprite_t *s = &FARMER_SPR[sheet_row[facing] * 3 + col];
-        /* he is bigger than a cell: stand him a little high, but keep him on screen */
-        int sx = cx, sy = cy - 6;
-        if (sx < s->w / 2) sx = s->w / 2;
-        if (sx > W - s->w / 2) sx = W - s->w / 2;
-        if (sy < s->h / 2) sy = s->h / 2;
-        if (sy > H - s->h / 2) sy = H - s->h / 2;
-        draw_sprite(s, sx, sy, 0x101010, dead ? 160 : 0);     /* charred */
+        /* the step frames sit one art pixel lower; lift them so his head glides level */
+        draw_sprite(s, (int)lround(fx), (int)lround(fy) - FEET_UP - (col ? s->h / 18 : 0),
+                    0x101010, dead ? 160 : 0);               /* charred */
     }
 
     draw_particles(P_CHUNK);
@@ -621,10 +677,9 @@ static void render(double t) {
 
 EMSCRIPTEN_KEEPALIVE
 void init_game(void) {
-    px_ = GRID / 2; py_ = GRID / 2;
+    fx = W / 2; fy = H / 2; kx = ky = 0.0;
     dead = 0; time_up = 0; hearts = MAXHEARTS; score = 0; defused = 0;
-    facing = 2; stride = 0; held = -1; next_hold = 0.0; walking = 0;
-    from_x = px_; from_y = py_; move_t0 = -1e9;
+    facing = 2; held = -1; walked = 0.0; moving = 0;
     memset(p_on, 0, sizeof p_on);
     memset(b_on, 0, sizeof b_on);
     memset(part, 0, sizeof part);
@@ -644,7 +699,8 @@ void frame(double now) {
         return;
     }
     if (now < last_now) now = last_now;
-    update_particles(now - last_now);         /* before new blasts emit theirs */
+    double dt = now - last_now;
+    update_particles(dt);                     /* before new blasts emit theirs */
     last_now = now;
     {
         double t = now - start_ms;
@@ -658,7 +714,7 @@ void frame(double now) {
                     while (tries++ < 40) {
                         cx = (int)(rng() % GRID);
                         cy = (int)(rng() % GRID);
-                        if (cx == px_ && cy == py_) continue;
+                        if (dist_to_cell(cx, cy) < SPAWN_CLEAR) continue;
                         {
                             int clash = 0;
                             for (j = 0; j < MAXPOT; j++)
@@ -684,60 +740,50 @@ void frame(double now) {
                 if (p_on[i] && limit >= p_dead[i]) explode(i, t);
             if (t >= ROUND_MS && !dead) {         /* buzzer: the field goes quiet */
                 time_up = 1;
-                held = -1; walking = 0;
+                held = -1; moving = 0;
                 memset(p_on, 0, sizeof p_on);
             }
         }
-        if (!dead && !time_up && held >= 0 && t >= next_hold) {       /* after blasts: expired fuses first */
-            /* keep the schedule so the walk is seamless, but never burst after a stall */
-            double at = t - next_hold > MOVE_MS ? t : next_hold;
-            do_move(held, at);
-            walking = 1;
-            next_hold = at + MOVE_MS;
+        /* movement comes after the blasts: an expired fuse cannot be walked off */
+        if (dt > 0) {
+            double sec = (dt > WALK_CAP_MS ? WALK_CAP_MS : dt) / 1000.0;
+            drift(sec);
+            moving = 0;
+            if (held >= 0 && !dead && !time_up) walk(WALK_SPEED * sec);
         }
         invalidate(t);
     }
 }
 
+/* Hold direction d (0 up, 1 right, 2 down, 3 left), or release (anything else),
+ * at time `now`. */
 EMSCRIPTEN_KEEPALIVE
-int step(int d) {
+void move(double now, int d) {
+    frame(now);                 /* the old direction applies right up to this instant */
+    if (d < 0 || d > 3) {
+        held = -1; moving = 0;
+    } else if (!dead && !time_up) {
+        if (held < 0) walked = 0.0;
+        held = facing = d;
+        moving = 1;             /* show the first stride immediately */
+    }
+    invalidate(started ? last_now - start_ms : 0.0);
+}
+
+EMSCRIPTEN_KEEPALIVE
+int step(int d) {               /* test/debug hook: walk exactly one cell at once */
     if (dead || time_up || d < 0 || d > 3) return score;
-    double t = started ? last_now - start_ms : 0.0;
-    do_move(d, t);
-    if (held >= 0 && next_hold < t + MOVE_MS) next_hold = t + MOVE_MS;
-    invalidate(t);
+    facing = d;
+    walk(CELL);
+    moving = 0;
+    invalidate(started ? last_now - start_ms : 0.0);
     return score;
 }
 
-/* A key is being held (d = 0..3) or released (anything else). frame() then keeps
- * walking that way; the first step is the caller's step(). */
 EMSCRIPTEN_KEEPALIVE
-void hold(int d) {
-    if (d < 0 || d > 3) { held = -1; walking = 0; return; }
-    if (d == held) return;
-    held = d;
-    double t = started ? last_now - start_ms : 0.0;
-    if (!walking) {
-        next_hold = t + HOLD_DELAY_MS;
-    } else if (!dead && !time_up) {
-        /* changing direction mid-walk: turn now and keep the pace, no new delay */
-        double ready = move_t0 + MOVE_MS;
-        next_hold = ready > t ? ready : t;
-        facing = d;
-        invalidate(t);
-    }
-}
-
-/* A movement key went down at time `now`. */
+double get_farmer_x(void) { return fx; }
 EMSCRIPTEN_KEEPALIVE
-void press(double now, int d) {
-    int was = held;
-    held = -1;                  /* the previous key must not get one last step in */
-    frame(now);                 /* bring the clock up to date: expired fuses blow first */
-    held = was;                 /* lets hold() see that we were already walking */
-    step(d);
-    hold(d);
-}
+double get_farmer_y(void) { return fy; }
 
 EMSCRIPTEN_KEEPALIVE
 void set_sized_potato(int x, int y, double fuse_ms, int size) {   /* test/debug hook */

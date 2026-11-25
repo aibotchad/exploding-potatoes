@@ -67,84 +67,77 @@ async function main() {
     seen.add(look(cx));
   }
   ok(seen.size === 4, 'farmer looks different facing each direction (' + seen.size + ')');
-  // where the farmer's green cap is drawn, as a mean x in pixels
-  const capX = () => {
-    let sum = 0, n = 0;
-    for (let y = 0; y < 672; y++)
-      for (let x = 0; x < 672; x++)
-        if (String(pixelAt(P, x, y)) === String(CAP)) { sum += x; n++; }
-    return n ? sum / n : NaN;
-  };
-  console.log('--- smooth movement ---');
-  P._init_game(); P._frame(1000);
-  const x0 = capX();
-  P._step(1);
-  const xs = [1025, 1050, 1075, 1120].map((now) => { P._frame(now); return capX(); });
-  ok(xs[0] > x0 && xs.every((x, i) => i === 0 || x > xs[i - 1]), 'a step glides across frames (' + [x0, ...xs].map(Math.round).join(' ') + ')');
-  P._frame(1300);
-  ok(Math.abs(capX() - xs[3]) < 6, 'glide stops on the next cell');
-  // hold right: one step now, repeats after the delay at a steady pace
-  P._init_game(); P._frame(1000);
-  P._step(1); P._hold(1);
-  const path_ = [];
-  for (let now = 1016; now <= 1640; now += 16) { P._frame(now); path_.push(capX()); }
-  const jumps = path_.slice(1).map((x, i) => x - path_[i]);
-  ok(Math.min(...jumps) > -4 && Math.max(...jumps) < 10, 'held walk never jumps or slides back (max ' + Math.max(...jumps).toFixed(1) + ' px/frame)');
-  ok(path_.at(-1) - x0 > 3 * 32, 'holding a key keeps walking (' + ((path_.at(-1) - x0) / 32).toFixed(1) + ' cells)');
-  P._hold(-1);
-  P._frame(1800); const rest = capX(); P._frame(2200);
-  ok(Math.abs(capX() - rest) < 1, 'releasing the key stops the walk');
-  P._init_game(); P._frame(1000);
-  P._step(1); P._hold(1); P._frame(1100); P._hold(-1); P._frame(1500);
-  ok(Math.abs(capX() - x0 - 32) < 6, 'a short tap moves exactly one cell');
-  P._init_game(); P._frame(1000);
-  P._hold(1); P._init_game(); P._frame(1000); P._frame(1600);
-  ok(Math.abs(capX() - x0) < 1, 'restart cancels a held key');
-  P._init_game(); P._frame(1000);
+  console.log('--- free movement ---');
+  const at = () => [P._get_farmer_x(), P._get_farmer_y()];
+  const run = (from, to, every = 16) => { for (let now = from; now < to;) P._frame(now = Math.min(to, now + every)); };
+  const fresh = () => { P._init_game(); P._frame(1000); };
+  const near = (a, b, tol = 0.01) => Math.abs(a - b) <= tol;
+  fresh(); P._move(1000, 1); run(1000, 1500);
+  ok(near(at()[0], 336 + 160) && at()[1] === 336, 'walks at a steady 320 px/s (' + at()[0].toFixed(1) + ')');
+  P._move(1500, -1); const stopped = String(at()); run(1500, 2000);
+  ok(String(at()) === stopped, 'stops the instant the key is released: no momentum');
+  fresh(); P._move(1000, 1); P._move(1100, 0);
+  ok(near(at()[0], 368) && at()[1] === 336, 'a turn happens exactly where he is');
+  fresh(); P._move(1000, 1); P._move(1030, -1);
+  ok(near(at()[0], 336 + 9.6), 'a short tap is a small nudge (' + (at()[0] - 336).toFixed(1) + ' px)');
+  fresh();
+  let worst = 0, diagonal = 0, last = at(), clock = 1000;
+  for (const [d, ms] of [[1, 260], [0, 250], [3, 48], [2, 250], [1, 16], [0, 16], [2, 100]]) {
+    P._move(clock, d);
+    for (let k = 0; k < Math.ceil(ms / 16); k++) {
+      P._frame(clock += 16);
+      const p = at(), dx = Math.abs(p[0] - last[0]), dy = Math.abs(p[1] - last[1]);
+      worst = Math.max(worst, dx + dy); if (dx > 0.001 && dy > 0.001) diagonal++; last = p;
+    }
+  }
+  ok(worst < 5.2 && diagonal === 0, 'no jumps or corner cutting through rapid turns (max ' + worst.toFixed(2) + ' px/frame)');
+  fresh(); P._move(1000, 0); run(1000, 1400, 7); const fast = at()[1];
+  fresh(); P._move(1000, 0); run(1000, 1400, 50);
+  ok(near(at()[1], fast), 'same distance at any frame rate');
+  fresh(); P._move(1000, 1); P._frame(9000);
+  ok(at()[0] <= 336 + 32.01, 'a stalled page cannot teleport him');
+  for (const [d, axis, limit] of [[0, 1, 33], [1, 0, 648], [2, 1, 651], [3, 0, 24]]) {
+    fresh(); for (let i = 0; i < 25; i++) P._step(d);
+    ok(at()[axis] === limit, 'wall ' + d + ' holds him at ' + limit);
+  }
+  for (const [name, x, y, path_] of [['top', 10, 0, [0]], ['bottom', 10, 20, [2]], ['left', 0, 10, [3]], ['right', 20, 10, [1]]]) {
+    fresh(); P._set_sized_potato(x, y, 100000, 0);
+    for (let i = 0; i < 12; i++) P._step(path_[0]);
+    ok(P._get_score() === 1, 'a small potato on the ' + name + ' edge can be reached');
+  }
+  fresh(); P._set_sized_potato(cx + 2, cy + 1, 100000, 2); for (let i = 0; i < 4; i++) P._step(1);
+  ok(P._get_score() === 0, 'walking along the next row does not defuse');
+  P._init_game(); P._frame(1000); P._move(1000, 1); P._move(1050, -1);
+  P._init_game(); P._frame(1000); run(1000, 1200);
+  ok(String(at()) === '336,336', 'restart cancels a held key');
 
-  console.log('--- turning has no delay ---');
-  // time from the key press until the farmer enters the new cell (shown by a defuse)
-  const turnTime = (cell, setup) => {
-    let now = 1000; P._init_game(); P._frame(now);
-    const run = (to) => { while (now < to) P._frame(++now); };
-    const press = setup(run);
-    const s = P._get_score(), t0 = now;
-    P._set_potato(cell[0], cell[1], 100000);
-    press();
-    while (P._get_score() === s && now - t0 < 600) run(now + 1);
-    return now - t0;
+  console.log('--- knockback ---');
+  // blow a potato `dx, dy` cells from the farmer and see where he ends up
+  const blast = (dx, dy, z, every = 16) => {
+    fresh(); P._set_sized_potato(cx + dx, cy + dy, 20, z); run(1000, 2000, every);
+    return [at()[0] - 336, at()[1] - 336];
   };
-  const walkRight = (until) => (run) => { P._step(1); P._hold(1); run(until); return () => { P._step(0); P._hold(0); }; };
-  const justAfter = turnTime([cx + 3, cy - 1], walkRight(1310));   // 20 ms after a held step
-  ok(justAfter === 0, 'turning right after a walking step is instant (' + justAfter + ' ms)');
-  const back = turnTime([cx + 4, cy - 2], (run) => {
-    P._step(0); P._hold(0); run(1050); P._step(1); P._hold(1); run(1470);
-    return () => P._hold(0);                                        // let go of right, still holding up
-  });
-  ok(back <= 100, 'falling back to a still-held key keeps the walking pace (' + back + ' ms)');
-  P._init_game(); P._frame(1000);
-  P._step(1); P._hold(1); P._frame(1050); P._step(0); P._hold(0); P._frame(1100); P._hold(-1); P._frame(1600);
-  P._set_potato(cx + 1, cy - 2, 100000);
-  const before = P._get_score(); P._step(0);
-  ok(P._get_score() === before + 3, 'two quick overlapping taps move one cell each');
+  const moved = [0, 1, 2].map((z) => -blast(1, 0, z)[0]);
+  ok(moved[0] > 15 && moved[0] < moved[1] && moved[1] < moved[2], 'bigger blast throws further (' + moved.map(Math.round).join(' < ') + ' px)');
+  const left = blast(-2, 0, 1), up = blast(0, -2, 1), corner = blast(1, 1, 1);
+  ok(left[0] > 0 && left[1] === 0 && up[1] > 0 && up[0] === 0 && corner[0] < 0 && corner[1] < 0, 'always away from the explosion');
+  ok(Math.abs(blast(1, 0, 1)[0]) > Math.abs(blast(3, 0, 1)[0]), 'closer means a harder push');
+  const miss = blast(3, 0, 1);
+  ok(miss[0] < -5 && P._get_hearts() === 3, 'a near miss pushes without hurting');
+  ok(String(blast(6, 0, 1)) === '0,0', 'far explosions do not push');
+  const under = blast(0, 0, 1);
+  ok(under[1] < -20 && P._get_hearts() === 2, 'standing on it: hurt and thrown backwards');
+  ok(near(blast(1, 0, 2, 7)[0], blast(1, 0, 2, 50)[0], 0.5), 'same knockback at any frame rate');
+  fresh(); P._set_sized_potato(cx + 1, cy, 20, 1); run(1000, 1600); const settled = String(at()); run(1600, 2600);
+  ok(String(at()) === settled, 'knockback dies out completely');
+  fresh(); P._set_sized_potato(cx + 1, cy, 20, 1); P._set_potato(cx - 1, cy + 3, 100000); run(1000, 1040);
+  P._set_sized_potato(cx - 1, cy, 100000, 0); run(1040, 1600);
+  ok(P._get_score() === 0, 'being thrown over a potato does not defuse it');
+  fresh(); P._set_sized_potato(cx + 2, cy, 20, 1); P._move(1000, 0); run(1000, 1250);
+  ok(at()[1] < 336 - 70 && at()[0] < 336 - 20, 'you can still steer while being thrown');
+  fresh(); for (let i = 0; i < 25; i++) P._step(3); for (let i = 0; i < 8; i++) P._set_sized_potato(1, cy, 20, 2); run(1000, 2000);
+  ok(at()[0] === 24 && at()[1] >= 33 && at()[1] <= 651, 'knockback never pushes him off the field');
 
-  console.log('--- tight controls ---');
-  // fast taps: the farmer is never drawn more than one cell behind the rules
-  P._init_game(); P._frame(1000);
-  const home = capX();
-  for (let i = 0; i < 6; i++) P._press(1010 + i * 30, 1);
-  P._hold(-1); P._frame(1161);
-  ok(capX() - home >= 5 * 32 - 4, 'rapid taps do not build up lag (' + ((capX() - home) / 32).toFixed(1) + ' of 6 cells drawn)');
-  P._frame(1260);
-  const arrived = capX(); P._frame(1600);
-  ok(Math.abs(arrived - home - 6 * 32) < 6 && capX() === arrived, 'stops dead within one step of the last tap');
-  // a held step falling due at the moment of a new press must not happen
-  P._init_game(); P._frame(1000);
-  P._press(1000, 1); P._frame(1150);                   // walking: next step due at 1250
-  P._set_potato(cx + 3, cy, 100000);
-  const s1 = P._get_score();
-  P._press(1255, 0);
-  ok(P._get_score() === s1, 'the old direction gets no extra step on a turn');
   P._init_game(); P._frame(1000);
 
   console.log('--- defuse: step onto a potato scores ---');
@@ -154,7 +147,7 @@ async function main() {
   ok(hasColorNear(P, cx + 1, cy, [0xe8, 0xc5, 0x47]), 'spawned potato rendered (yellow, young fuse)');
   const s = P._step(1);                // step right
   ok(P._get_score() === s0 + 3, 'stepping onto a medium potato scores 3 (score ' + s0 + ' -> ' + P._get_score() + ')');
-  P._frame(1160);                        // let the glide finish
+  P._frame(1160);
   ok(hasColorNear(P, cx + 1, cy, CAP), 'farmer now on defused cell');
 
   console.log('--- explosion damage: in blast => lose heart ---');
@@ -171,9 +164,10 @@ async function main() {
   P._frame(1560);
   ok(P._get_hearts() === h1, 'potato 5 cells away does not damage player');
 
+  P._init_game(); P._frame(1000);      // knockback moved him: start from the middle again
   const h2 = P._get_hearts();
   P._set_potato(cx + 1, cy, 100);      // adjacent - in blast
-  P._frame(1760);
+  P._frame(1200);
   ok(P._get_hearts() === h2 - 1, 'potato adjacent hits player (chebyshev <= 2)');
 
   console.log('--- chain: blast clears caught potatoes ---');
@@ -189,12 +183,11 @@ async function main() {
   console.log('--- death: 0 hearts ends game ---');
   P._init_game();
   P._frame(10000);
-  P._set_potato(cx, cy, 50);
-  P._frame(10100);
-  P._set_potato(cx, cy, 50);
-  P._frame(10200);
-  P._set_potato(cx, cy, 50);
-  P._frame(10300);
+  // each blast throws him, so drop the next one wherever he lands
+  const underFoot = () => P._set_potato(Math.floor(P._get_farmer_x() / 32), Math.floor(P._get_farmer_y() / 32), 50);
+  underFoot(); P._frame(10100);
+  underFoot(); P._frame(10200);
+  underFoot(); P._frame(10300);
   ok(P._get_hearts() === 0, 'three blasts drain hearts to 0');
   ok(P._get_dead() === 1, 'game over after third blast');
   const sD = P._step(1);                // stepping after death should not crash / not score
@@ -296,11 +289,11 @@ async function main() {
   P._frame(61000);
   ok(alive && P._get_over() === 1 && P._get_time_left() === 0, 'round ends at 60 s');
   P._set_potato(cx + 2, cy, 100000);
-  P._step(1); P._press(61100, 1); P._frame(62000);
+  P._step(1); P._move(61100, 1); P._frame(62000);
   ok(atBuzzer === 3 && P._get_score() === 3, 'no moving or scoring after time is up');
   P._init_game();
   ok(P._get_over() === 0 && P._get_time_left() === 60000, 'restart resets the clock');
-  P._frame(1000); P._press(1000, 1); P._frame(60900); P._frame(70000);
+  P._frame(1000); P._move(1000, 1); P._frame(60900); P._frame(70000);
   const held0 = P._get_particles();
   ok(P._get_over() === 1 && P._get_potatoes() === 0 && held0 === 0, 'field is cleared at the buzzer, nothing blows later');
   // a fuse that ran out before the buzzer still explodes, even if the frame is late
